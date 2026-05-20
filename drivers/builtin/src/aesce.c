@@ -46,6 +46,7 @@
 #include <string.h>
 
 #include "aesce.h"
+#include "constant_time_internal.h"
 
 #if defined(MBEDTLS_AESCE_HAVE_CODE)
 
@@ -294,6 +295,107 @@ static void mbedtls_aesce_load_keys(mbedtls_aes_context *ctx, uint8x16_t *vkeys)
     }
 #endif
 }
+
+#if defined(MBEDTLS_CIPHER_MODE_CTR) && defined(MBEDTLS_AES_C)
+MBEDTLS_OPTIMIZE_FOR_PERFORMANCE
+void mbedtls_aesce_encrypt_blocks_ctr(mbedtls_aes_context *ctx,
+                                      size_t blocks,
+                                      unsigned char counter[16],
+                                      const unsigned char *input,
+                                      unsigned char *output)
+{
+    // reverse to get bytes in LE order (note that top and bottom elements are inverted)
+    uint64x2_t ctr_le = vreinterpretq_u64_u8(vrev64q_u8(vld1q_u8(counter)));
+
+    // constant used for incrementing counter
+    const uint64x2_t k0_1 = vcombine_u64(vcreate_u64(0), vcreate_u64(1));
+
+    // Determine the point to exit the inner loop where either
+    // (a) we run out of blocks
+    // (b) we need to propagate a carry in the counter
+    //
+    // In case no carry propagation is required, we pick a point and exit
+    // anyway to ensure constant-time behaviour w.r.t. the counter value.
+    // This means that for blocks > 1, we do two carry propagations of which
+    // at least one is a no-op, and for blocks == 1, we do one.
+    //
+    // There are a lot of awkward edge cases in correctly selecting the point to
+    // exit the inner loop. Careful testing is needed.
+
+    // Number of blocks that can be processed before we hit a block which
+    // requires us to propagate the carry
+    uint64_t blocks_with_no_carry = UINT64_MAX - vgetq_lane_u64(ctr_le, 1);
+
+    // Select a point to break the main-loop for possible carry propagation.
+    //
+    // We process max(1, limit) blocks, then carry-propagate, then process
+    // remaining blocks, then carry-propagate.
+    //
+    // limit is checked after processing a block, so we always process one block
+    // even if limit == 0; otherwise exactly limit blocks are processed before
+    // doing carry propagation.
+    //
+    // If no carry propagation is needed (bwnc >= blocks):
+    //      any point is ok
+    //      limit = 0 -> process 1 block
+    // If needed for the last block (bwnc == blocks - 1):
+    //      any point is ok because we always propagate after the last block
+    //      limit = 0 -> process 1 block
+    // Otherwise (bwnc < blocks - 1):
+    //      block after processing bwnc blocks requires carry
+    //      limit = bwnc + 1
+    //
+    // The result is only used if blocks > 0 (so "blocks - 1u" is harmless).
+    size_t limit = mbedtls_ct_size_if_else_0(
+        mbedtls_ct_uint_lt(blocks_with_no_carry, blocks - 1u),
+        blocks_with_no_carry + 1u
+        );
+
+    uint8x16_t vkeys[15];
+    mbedtls_aesce_load_keys(ctx, vkeys);
+
+    int nr = MBEDTLS_AES_GET_NR(ctx);
+
+    size_t i = 0;
+    while (i < blocks) {
+        // process blocks up to point of needing carry propagation in counter
+        // (at least one block)
+        do {
+            uint8x16_t ctr_be = vrev64q_u8(vreinterpretq_u8_u64(ctr_le));
+            uint8x16_t in = vld1q_u8(&input[i * 16]);
+            uint8x16_t block = aesce_encrypt_block_inline(ctr_be, vkeys, nr);
+            uint8x16_t output_block = veorq_u8(block, in);
+            ctr_le = vaddq_u64(ctr_le, k0_1);
+            vst1q_u8(&output[i * 16], output_block);
+        } while (++i < limit);
+
+        // Propagate carry from incrementing counter - this is slow so
+        // needs to be pulled out of the main loop above. This is a no-op
+        // if the least-significant 64 bits of the counter did not wrap.
+        //
+        // equivalent to: ctr_le[0] += ctr_le[1] == 0 ? 1 : 0
+#if defined(__aarch64__)
+        // saturating left shift - top bit set iff ctr_le is non-zero
+        uint64x1_t x = vqshl_n_u64(vget_high_u64(ctr_le), 63);
+        // cast to signed 64-bit, compare to 0. result is 0 or all bits set
+        uint64x1_t is_zero = vcge_s64(vreinterpret_s64_u64(x), vcreate_s64(0));
+        // apply to ctr_le
+        uint64x2_t inc = vcombine_u64(is_zero, vcreate_u64(0));
+        ctr_le = vsubq_u64(ctr_le, inc);
+#else
+        // A32 lacks suitable intrinsics for 64-bit comparison, so just use scalar
+        uint64_t ls64 = vgetq_lane_u64(ctr_le, 1);
+        uint64x2_t inc = vcombine_u64(vcreate_u64(ls64 == 0 ? 1 : 0), vcreate_u64(0));
+        ctr_le = vaddq_u64(ctr_le, inc);
+#endif
+
+        limit = blocks;
+    }
+
+    vst1q_u8(counter, vrev64q_u8(vreinterpretq_u8_u64(ctr_le)));
+}
+
+#endif // MBEDTLS_CIPHER_MODE_CTR && MBEDTLS_AES_C
 
 /*
  * AES-ECB block en(de)cryption
