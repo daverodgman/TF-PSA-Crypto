@@ -116,12 +116,17 @@ int mbedtls_aesce_crypt_ecb(mbedtls_aes_context *ctx,
  * \param output   Output data
  * \param blocks   Number of 16-byte blocks to process
  */
+
+#if MBEDTLS_AESCE_OPTIMISE_FOR_SIZE == 0
+
 void mbedtls_aesce_gcm_update_blocks(
     mbedtls_aes_context *aes_ctx,
     mbedtls_gcm_context *ctx,
     const unsigned char *input,
     unsigned char *output,
     size_t blocks);
+
+#endif // MBEDTLS_AESCE_OPTIMISE_FOR_SIZE
 
 /**
  * \brief          Internal AES-GCM partial block encryption and decryption
