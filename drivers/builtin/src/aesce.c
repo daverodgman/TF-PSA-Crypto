@@ -174,16 +174,16 @@ static uint8x16_t aesce_encrypt_block(uint8x16_t block,
                                       int rounds)
 {
     /* 10, 12 or 14 rounds. Unroll loop. */
-    if (rounds == 10) {
-        goto rounds_10;
+#if defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
+    (void) rounds;
+#else
+    if (rounds & 4) {
+        if (rounds & 2) {
+            AESCE_ENCRYPT_ROUND_X2;
+        }
+        AESCE_ENCRYPT_ROUND_X2;
     }
-    if (rounds == 12) {
-        goto rounds_12;
-    }
-    AESCE_ENCRYPT_ROUND_X2;
-rounds_12:
-    AESCE_ENCRYPT_ROUND_X2;
-rounds_10:
+#endif
     AESCE_ENCRYPT_ROUND_X2;
     AESCE_ENCRYPT_ROUND_X2;
     AESCE_ENCRYPT_ROUND_X2;
@@ -237,16 +237,16 @@ static uint8x16_t aesce_decrypt_block(uint8x16_t block,
                                       int rounds)
 {
     /* 10, 12 or 14 rounds. Unroll loop. */
-    if (rounds == 10) {
-        goto rounds_10;
+#if defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
+    (void) rounds;
+#else
+    if (rounds & 4) {
+        if (rounds & 2) {
+            AESCE_DECRYPT_ROUND_X2;
+        }
+        AESCE_DECRYPT_ROUND_X2;
     }
-    if (rounds == 12) {
-        goto rounds_12;
-    }
-    AESCE_DECRYPT_ROUND_X2;
-rounds_12:
-    AESCE_DECRYPT_ROUND_X2;
-rounds_10:
+#endif
     AESCE_DECRYPT_ROUND_X2;
     AESCE_DECRYPT_ROUND_X2;
     AESCE_DECRYPT_ROUND_X2;
