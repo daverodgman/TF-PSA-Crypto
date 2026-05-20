@@ -802,42 +802,6 @@ void mbedtls_aesce_gcm_update_block_partial(
 
 #if MBEDTLS_AESCE_OPTIMISE_FOR_SIZE == 0
 
-MBEDTLS_MAYBE_UNUSED
-static inline uint8x16_t ghash_update_x4(uint8x16_t X,
-                                               uint8x16_t *Y,
-                                               const uint8x16x4_t vh
-) {
-    /*
-     * Equivalent to:
-     *
-     * for (unsigned i = 0; i < 4; i++) {
-     *     acc = veorq_u8_x3(acc, poly_mult_128(vrbitq_u8(Y[i]), vh.val[3 - i]))
-     * }
-     *
-     * Unrolling and taking advantage of eor3 gains significant perf,
-     * especially for GCC.
-     */
-
-    uint8x16x4_t acc = poly_mult_128(vrbitq_u8(X),  vh.val[3]);
-
-    uint8x16x4_t a = poly_mult_128(vrbitq_u8(Y[0]), vh.val[3]);
-    uint8x16x4_t b = poly_mult_128(vrbitq_u8(Y[1]), vh.val[2]);
-    acc.val[0] = VEOR3Q_U8(acc.val[0], a.val[0], b.val[0]);
-    acc.val[1] = VEOR3Q_U8(acc.val[1], a.val[1], b.val[1]);
-    acc.val[2] = VEOR3Q_U8(acc.val[2], a.val[2], b.val[2]);
-    acc.val[3] = VEOR3Q_U8(acc.val[3], a.val[3], b.val[3]);
-
-    uint8x16x4_t c = poly_mult_128(vrbitq_u8(Y[2]), vh.val[1]);
-    uint8x16x4_t d = poly_mult_128(vrbitq_u8(Y[3]), vh.val[0]);
-    acc.val[0] = VEOR3Q_U8(acc.val[0], c.val[0], d.val[0]);
-    acc.val[1] = VEOR3Q_U8(acc.val[1], c.val[1], d.val[1]);
-    acc.val[2] = VEOR3Q_U8(acc.val[2], c.val[2], d.val[2]);
-    acc.val[3] = VEOR3Q_U8(acc.val[3], c.val[3], d.val[3]);
-
-    uint8x16_t Rr = poly_mult_reduce(acc);
-    return vrbitq_u8(Rr);
-}
-
 #define MBEDTLS_AESCE_GCM_MULTIBLOCK 4
 
 MBEDTLS_OPTIMIZE_FOR_PERFORMANCE
@@ -854,17 +818,18 @@ void mbedtls_aesce_gcm_update_blocks(
     const int nr = MBEDTLS_AES_GET_NR(aes_ctx);
 
     const uint32x4_t k1 = vsetq_lane_u32(1, vdupq_n_u32(0), 3);
-    uint8x16_t vbuf     = vld1q_u8(ctx->buf);
+    // native-endianness version of the counter
     uint8x16_t vctr_ne  = MBEDTLS_IS_BIG_ENDIAN ? vld1q_u8(ctx->y) : vrev32q_u8(vld1q_u8(ctx->y));
     uint8x16_t ve[MBEDTLS_AESCE_GCM_MULTIBLOCK];
 
-    uint8x16_t vio[MBEDTLS_AESCE_GCM_MULTIBLOCK * 2];
-    uint8x16_t *vin = &vio[0];
-    uint8x16_t *vout = &vio[MBEDTLS_AESCE_GCM_MULTIBLOCK];
+    uint8x16_t vin[MBEDTLS_AESCE_GCM_MULTIBLOCK];
+    uint8x16_t vout[MBEDTLS_AESCE_GCM_MULTIBLOCK];
 #if MBEDTLS_GCM_DECRYPT != 0 || MBEDTLS_GCM_ENCRYPT != 1
 #error This code assumes MBEDTLS_GCM_DECRYPT == 0 && MBEDTLS_GCM_ENCRYPT == 1
 #endif
-    uint8x16_t *cts = &vio[ctx->mode * MBEDTLS_AESCE_GCM_MULTIBLOCK];
+    const unsigned mode = ctx->mode;
+    uint8x16_t vtag = vrbitq_u8(vld1q_u8(ctx->buf));
+    MBEDTLS_MAYBE_UNUSED const uint8x16x4_t vh = ctx->vghash_4;
 
     // compute keystream in ve
     for (size_t b = 0;
@@ -916,24 +881,95 @@ void mbedtls_aesce_gcm_update_blocks(
 
         vout[0] = veorq_u8(vin[0], ve[0]);
         vst1q_u8(&output[0], vout[0]);
-
         vout[1] = veorq_u8(vin[1], ve[1]);
         vst1q_u8(&output[16], vout[1]);
-
         vout[2] = veorq_u8(vin[2], ve[2]);
         vst1q_u8(&output[32], vout[2]);
-
         vout[3] = veorq_u8(vin[3], ve[3]);
         vst1q_u8(&output[48], vout[3]);
 
-        vbuf = ghash_update_x4(vbuf, cts, ctx->vghash_4);
-
         input  += 16 * MBEDTLS_AESCE_GCM_MULTIBLOCK;
         output += 16 * MBEDTLS_AESCE_GCM_MULTIBLOCK;
+
+        /*
+         * Calculate GCM tag for 4 blocks.
+         *
+         * This gets significant performance and code-size benefits from
+         * unrolling and manually ordering the operations to mitigate data
+         * dependencies (which is why the ordering looks a bit irregular).
+         * Unrolling also allows use of veor3q which saves a few
+         * instructions and helps performance.
+         *
+         * We also take advantage of doing 4 blocks at once by
+         * - xor'ing the tag with the first ciphertext before multiplying,
+         *   which saves a call to poly_mult_128
+         * - doing a single reduction at the end instead after each block
+         * - pre-computing powers of vh (ie. vh, vh * vh, vh * vh * vh,
+         *   vh * vh * vh * vh), to facilitate computing over each block
+         *   independently
+         *
+         * This is derived from the ifdef'd out block, which is
+         * present for reference.
+         */
+    #if 0
+        // get hash key hk
+        const uint8x16_t hash_key = vh.val[0];
+        // iterate over 4 blocks
+        for (int i = 0; i < 4; i++) {
+            // get ciphertext block ct
+            uint8x16_t ct = mode == MBEDTLS_AES_ENCRYPT ? vout[i] : vin[i];
+            // vtag is kept in the pmull domain, ie.
+            // each byte is bit-reversed as per vrbitq_u8.
+            //
+            // vtag_normal = vtag, converted to normal domain
+            uint8x16_t vtag_normal = vrbitq_u8(vtag);
+            // xor with ciphertext
+            vtag_normal = veorq_u8(vtag_normal, ct);
+            // convert tag back to pmull domain
+            vtag = vrbitq_u8(vtag_normal);
+            // multiply tag by hash key, resulting in 4x128-bit representation
+            uint8x16x4_t tag_x4 = poly_mult_128(vtag, hash_key);
+            // reduce tag back to 128-bit representation
+            vtag = poly_mult_reduce(tag_x4);
+        }
+    #else
+        uint8x16_t ct0, ct1, ct2, ct3;
+        if (mode == MBEDTLS_AES_ENCRYPT) {
+            ct0 = vout[0];
+            ct1 = vout[1];
+            ct2 = vout[2];
+            ct3 = vout[3];
+        } else {
+            ct0 = vin[0];
+            ct1 = vin[1];
+            ct2 = vin[2];
+            ct3 = vin[3];
+        }
+
+        uint8x16x4_t r;
+        ct0 = vrbitq_u8(ct0);
+        uint8x16_t a = veorq_u8(vtag, ct0);
+        ct1 = vrbitq_u8(ct1);
+        uint8x16x4_t ha = poly_mult_128(a, vh.val[3]);
+        uint8x16x4_t hb = poly_mult_128(ct1, vh.val[2]);
+        uint8x16_t t2 = veorq_u8(ha.val[1], ha.val[2]);
+        uint8x16_t t1 = veorq_u8(ha.val[0], hb.val[0]);
+        uint8x16_t t5 = veorq_u8(ha.val[3], hb.val[3]);
+        r.val[1] = VEOR3Q_U8(t2, hb.val[1], hb.val[2]);
+        ct2 = vrbitq_u8(ct2);
+        uint8x16x4_t hc = poly_mult_128(ct2, vh.val[1]);
+        ct3 = vrbitq_u8(ct3);
+        uint8x16x4_t hd = poly_mult_128(ct3, vh.val[0]);
+        uint8x16_t t7 = veorq_u8(hc.val[1], hc.val[2]);
+        r.val[0] = VEOR3Q_U8(t1, hc.val[0], hd.val[0]);
+        r.val[3] = VEOR3Q_U8(t5, hc.val[3], hd.val[3]);
+        r.val[2] = VEOR3Q_U8(t7, hd.val[1], hd.val[2]);
+        vtag = poly_mult_reduce(r);
+#endif
     }
 
     uint8x16_t vctr_be = MBEDTLS_IS_BIG_ENDIAN ? vctr_ne : vrev32q_u8(vctr_ne);
-    vst1q_u8(ctx->buf, vbuf);
+    vst1q_u8(ctx->buf, vrbitq_u8(vtag));
     vst1q_u8(ctx->y, vctr_be);
 
     size_t n = blocks % MBEDTLS_AESCE_GCM_MULTIBLOCK;
@@ -947,7 +983,7 @@ void mbedtls_aesce_gcm_update_blocks(
                 0,
                 16,
                 scratch
-            );
+                );
             input += 16;
             output += 16;
         }
