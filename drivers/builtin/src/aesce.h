@@ -110,7 +110,8 @@ void mbedtls_aesce_inverse_key(unsigned char *invkey,
  *
  * \return          0 if successful, or MBEDTLS_ERR_AES_INVALID_KEY_LENGTH
  */
-int mbedtls_aesce_setkey_enc(unsigned char *rk,
+int mbedtls_aesce_setkey_enc(mbedtls_aes_context *ctx,
+                             unsigned char *rk,
                              const unsigned char *key,
                              size_t key_bit_length);
 

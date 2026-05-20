@@ -70,6 +70,9 @@ typedef struct mbedtls_aes_context {
     uint32_t MBEDTLS_PRIVATE(buf)[44];           /*!< Aligned data buffer to hold
                                                     10 round keys for 128-bit case. */
 #endif /* MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH */
+#if defined(MBEDTLS_AESCE_HAVE_CODE)
+    uint8x16_t vkeys[15];                       /* Neon copy of the round keys. */
+#endif
 #if defined(MBEDTLS_AESNI_C)
     size_t MBEDTLS_PRIVATE(rk_offset);           /*!< The offset in array elements to AES
                                                     round keys in the buffer. */
