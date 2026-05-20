@@ -356,6 +356,7 @@ int mbedtls_aesce_setkey_enc(mbedtls_aes_context *ctx,
                              const size_t key_bit_length)
 {
 
+    uint8_t *r = rk;
 #if defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
     MBEDTLS_ASSUME(key_bit_length == 128);
 #else
@@ -364,7 +365,7 @@ int mbedtls_aesce_setkey_enc(mbedtls_aes_context *ctx,
     // part of ctx->buf)
     // this layout simplifies loading into NEON registers, which helps
     // size and perf
-    rk += (256 - key_bit_length) >> 1;
+    r += (256 - key_bit_length) >> 1;
 #endif
 
     static uint8_t const rcon[] = { 0x01, 0x02, 0x04, 0x08, 0x10,
@@ -378,36 +379,34 @@ int mbedtls_aesce_setkey_enc(mbedtls_aes_context *ctx,
     const size_t rounds_needed = key_len_in_words + 6;      /* Nr */
     const size_t round_keys_len_in_words =
         round_key_len_in_words * (rounds_needed + 1);       /* Nb*(Nr+1) */
-    const uint32_t *rko_end = (uint32_t *) rk + round_keys_len_in_words;
+    const uint32_t *rko_end = (uint32_t *) r + round_keys_len_in_words;
 
     uint8x16_t vk = vld1q_u8(key);
-    vst1q_u8(rk, vk);
+    vst1q_u8(r, vk);
 #if !defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
-    vk = vld1q_u8(key + (key_bit_length - 128)/8);
-    vst1q_u8(rk + (key_bit_length - 128)/8, vk);
+    vk = vld1q_u8(key + (key_bit_length - 128) / 8);
+    vst1q_u8(r + (key_bit_length - 128) / 8, vk);
 #endif
 
-    for (uint32_t *rki = (uint32_t *) rk;
+    for (uint32_t *rki = (uint32_t *) r, iteration = 0;
          rki + key_len_in_words < rko_end;
-         rki += key_len_in_words) {
-
-        size_t iteration = (size_t) (rki - (uint32_t *) rk) / key_len_in_words;
-
+         rki += key_len_in_words, iteration++) {
         uint32_t *rko;
         rko = rki + key_len_in_words;
         rko[0] = aes_rot_word(aes_sub_word(rki[key_len_in_words - 1]));
         rko[0] ^= rcon[iteration] ^ rki[0];
+
+#if defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
         rko[1] = rko[0] ^ rki[1];
         rko[2] = rko[1] ^ rki[2];
         rko[3] = rko[2] ^ rki[3];
-#if !defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
-        rko[4] = rko[3] ^ rki[4];
-        if (key_bit_length == 256) {
-            rko[4] = aes_sub_word(rko[3]) ^ rki[4];
+#else
+        for (unsigned i = 0; i < 7; i++) {
+            rko[i + 1] = rko[i] ^ rki[i + 1];
+            if (key_bit_length == 256 && i == 3) {
+                rko[4] = aes_sub_word(rko[3]) ^ rki[4];
+            }
         }
-        rko[5] = rko[4] ^ rki[5];
-        rko[6] = rko[5] ^ rki[6];
-        rko[7] = rko[6] ^ rki[7];
 #endif
     }
 
