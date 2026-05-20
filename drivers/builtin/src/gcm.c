@@ -45,6 +45,17 @@
 #define MBEDTLS_GCM_ACC_AESNI       2
 #define MBEDTLS_GCM_ACC_AESCE       3
 
+#if !defined(MBEDTLS_AES_C)
+// Helper macro to get the AES context from a GCM context
+#define GCM_GET_AES_CTX(gcm_ctx)     NULL
+#else // MBEDTLS_AES_C
+#if defined(MBEDTLS_BLOCK_CIPHER_C)
+#define GCM_GET_AES_CTX(gcm_ctx)     (&((gcm_ctx)->block_cipher_ctx.ctx.aes))
+#elif defined(MBEDTLS_CIPHER_C)
+#define GCM_GET_AES_CTX(gcm_ctx)     ((mbedtls_aes_context *) ((gcm_ctx)->cipher_ctx.cipher_ctx))
+#endif
+#endif // MBEDTLS_AES_C
+
 /*
  * Initialize a context
  */
@@ -53,8 +64,39 @@ void mbedtls_gcm_init(mbedtls_gcm_context *ctx)
     memset(ctx, 0, sizeof(mbedtls_gcm_context));
 }
 
+static unsigned gcm_use_aesce(mbedtls_gcm_context *ctx)
+{
+    /* Helper function to determine if GCM cipher operations should use AESCE -
+     * ie., AESCE is compiled in, supported by the hardware and the cipher being
+     * used is AES.
+     *
+     * This differs from gcm_get_acceleration() which is used to determine if
+     * GCM tag operations (independent of cipher) should use AESCE.
+     *
+     * This all typically resolves to a compile-time constant, which is
+     * very impactful for code-size. */
+    (void) ctx;
+    // first check AESCE is built and supported
+#if defined(MBEDTLS_AESCE_HAVE_CODE)
+    if (MBEDTLS_AESCE_HAS_SUPPORT()) {
+        // check cipher is AES
+#if defined(MBEDTLS_ONLY_GCM_CIPHER_IS_AES)
+        return 1;
+#elif defined(MBEDTLS_BLOCK_CIPHER_C)
+        return ctx->block_cipher_ctx.id == MBEDTLS_BLOCK_CIPHER_ID_AES;
+#elif defined(MBEDTLS_CIPHER_C)
+        return ctx->cipher_ctx.cipher_info->type == MBEDTLS_CIPHER_ID_AES;
+#else
+#error Neither MBEDTLS_BLOCK_CIPHER_C or MBEDTLS_CIPHER_C is defined
+#endif // AES cipher check
+    }
+#endif // MBEDTLS_AESCE_HAVE_CODE
 
-static inline unsigned gcm_get_acceleration()
+    // Either AESCE not available, or cipher is not AES
+    return 0;
+}
+
+static inline unsigned gcm_get_acceleration(void)
 {
 #if defined(MBEDTLS_AESCE_HAVE_CODE)
     /* Note: we do not need AES support to use the AESCE GCM implementation
@@ -165,9 +207,15 @@ int mbedtls_gcm_setkey(mbedtls_gcm_context *ctx,
 {
     int ret = MBEDTLS_ERR_ERROR_CORRUPTION_DETECTED;
 
+#if defined(MBEDTLS_ONLY_GCM_CIPHER_IS_AES) && defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
+    if (keybits != 128) {
+        return MBEDTLS_ERR_GCM_BAD_INPUT;
+    }
+#else
     if (keybits != 128 && keybits != 192 && keybits != 256) {
         return MBEDTLS_ERR_GCM_BAD_INPUT;
     }
+#endif
 
 #if defined(MBEDTLS_BLOCK_CIPHER_C)
     mbedtls_block_cipher_free(&ctx->block_cipher_ctx);
@@ -204,11 +252,7 @@ int mbedtls_gcm_setkey(mbedtls_gcm_context *ctx,
     }
 #endif
 
-    if ((ret = gcm_gen_table(ctx)) != 0) {
-        return ret;
-    }
-
-    return 0;
+    return gcm_gen_table(ctx);
 }
 
 #if defined(MBEDTLS_GCM_LARGE_TABLE)
