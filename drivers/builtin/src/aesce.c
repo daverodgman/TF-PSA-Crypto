@@ -161,17 +161,17 @@ int mbedtls_aesce_has_support_impl(void)
 #endif /* defined(__linux__) && !defined(MBEDTLS_AES_USE_HARDWARE_ONLY) */
 
 /* Single round of AESCE encryption */
-#define AESCE_ENCRYPT_ROUND                   \
-    block = vaeseq_u8(block, vld1q_u8(keys)); \
-    block = vaesmcq_u8(block);                \
-    keys += 16
+#define AESCE_ENCRYPT_ROUND(k)          \
+    block = vaeseq_u8(block, keys[k]);  \
+    block = vaesmcq_u8(block);
 /* Two rounds of AESCE encryption */
-#define AESCE_ENCRYPT_ROUND_X2        AESCE_ENCRYPT_ROUND; AESCE_ENCRYPT_ROUND
+#define AESCE_ENCRYPT_ROUND_X2(k)       \
+    AESCE_ENCRYPT_ROUND(k);             \
+    AESCE_ENCRYPT_ROUND(k + 1)
 
-MBEDTLS_OPTIMIZE_FOR_PERFORMANCE
 static uint8x16_t aesce_encrypt_block(uint8x16_t block,
-                                      unsigned char *keys,
-                                      int rounds)
+                                      uint8x16_t keys[14],
+                                      unsigned rounds)
 {
     /* 10, 12 or 14 rounds. Unroll loop. */
 #if defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
@@ -179,27 +179,21 @@ static uint8x16_t aesce_encrypt_block(uint8x16_t block,
 #else
     if (rounds & 4) {
         if (rounds & 2) {
-            AESCE_ENCRYPT_ROUND_X2;
+            AESCE_ENCRYPT_ROUND_X2(0);
         }
-        AESCE_ENCRYPT_ROUND_X2;
+        AESCE_ENCRYPT_ROUND_X2(2);
     }
 #endif
-    AESCE_ENCRYPT_ROUND_X2;
-    AESCE_ENCRYPT_ROUND_X2;
-    AESCE_ENCRYPT_ROUND_X2;
-    AESCE_ENCRYPT_ROUND_X2;
-    AESCE_ENCRYPT_ROUND;
+    AESCE_ENCRYPT_ROUND_X2(4);
+    AESCE_ENCRYPT_ROUND_X2(6);
+    AESCE_ENCRYPT_ROUND_X2(8);
+    AESCE_ENCRYPT_ROUND_X2(10);
+    AESCE_ENCRYPT_ROUND(12);
 
     /* AES AddRoundKey for the previous round.
      * SubBytes, ShiftRows for the final round.  */
-    block = vaeseq_u8(block, vld1q_u8(keys));
-    keys += 16;
-
-    /* Final round: no MixColumns */
-
-    /* Final AddRoundKey */
-    block = veorq_u8(block, vld1q_u8(keys));
-
+    block = vaeseq_u8(block, keys[13]);
+    block = veorq_u8(block, keys[14]);
     return block;
 }
 
@@ -265,6 +259,14 @@ static uint8x16_t aesce_decrypt_block(uint8x16_t block,
 }
 #endif
 
+static void mbedtls_aesce_load_keys(mbedtls_aes_context *ctx, uint8x16_t *vkeys) {
+    int nr = MBEDTLS_AES_GET_NR(ctx);
+    unsigned char *keys = (unsigned char *) (ctx->buf + MBEDTLS_AES_GET_RK_OFFSET(ctx));
+    for (int i = 0; i < nr + 1; i++) {
+        vkeys[i + 14 - nr] = vld1q_u8(&keys[i * 16]);
+    }
+}
+
 /*
  * AES-ECB block en(de)cryption
  */
@@ -274,10 +276,10 @@ int mbedtls_aesce_crypt_ecb(mbedtls_aes_context *ctx,
                             unsigned char output[16])
 {
     uint8x16_t block = vld1q_u8(&input[0]);
-    unsigned char *keys = (unsigned char *) (ctx->buf + MBEDTLS_AES_GET_RK_OFFSET(ctx));
     int nr = MBEDTLS_AES_GET_NR(ctx);
 
 #if !defined(MBEDTLS_BLOCK_CIPHER_NO_DECRYPT)
+    unsigned char *keys = (unsigned char *) (ctx->buf + MBEDTLS_AES_GET_RK_OFFSET(ctx));
     if (mode == MBEDTLS_AES_DECRYPT) {
         block = aesce_decrypt_block(block, keys, nr);
     } else
@@ -285,7 +287,9 @@ int mbedtls_aesce_crypt_ecb(mbedtls_aes_context *ctx,
     (void) mode;
 #endif
     {
-        block = aesce_encrypt_block(block, keys, nr);
+        uint8x16_t vkeys[15];
+        mbedtls_aesce_load_keys(ctx, vkeys);
+        block = aesce_encrypt_block(block, vkeys, nr);
     }
     vst1q_u8(&output[0], block);
 
