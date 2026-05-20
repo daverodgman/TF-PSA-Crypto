@@ -1,3 +1,8 @@
+scripts
+drivers/builtin/src/opts.h
+**/Makefile
+**/.DS_Store
+
 # Random seed file created by test scripts and sample programs
 seedfile
 # Log files created by all.sh to reduce the logs in case a component runs
@@ -72,3 +77,4 @@ compile_commands.json
 
 # VScode folder to store local debug files and configurations
 .vscode
+

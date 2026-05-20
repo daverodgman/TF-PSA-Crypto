@@ -45,6 +45,40 @@
  * \{
  */
 
+#define PSA_WANT_KEY_TYPE_AES                   1
+//#define PSA_WANT_ALG_CTR                        1
+#define PSA_WANT_ALG_GCM                        1
+
+#define PSA_WANT_ALG_SHA_256                    1
+#define PSA_WANT_ALG_TLS12_PRF                  1
+#define MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH
+#define MBEDTLS_BLOCK_CIPHER_NO_DECRYPT
+#define MBEDTLS_AESCE_OPTIMISE_FOR_SIZE         1
+
+
+#define MBEDTLS_AESCE_C
+
+#if defined(MBEDTLS_AESCE_C)
+#define MBEDTLS_AES_USE_HARDWARE_ONLY
+#endif
+
+#define MBEDTLS_MD_C
+#if defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
+#define MBEDTLS_PSA_CRYPTO_RNG_STRENGTH 128
+#endif
+#define MBEDTLS_CTR_DRBG_C
+#define MBEDTLS_PSA_BUILTIN_GET_ENTROPY
+#define MBEDTLS_PSA_CRYPTO_C
+#define MBEDTLS_HAVE_TIME
+#define MBEDTLS_HAVE_TIME_DATE
+#define MBEDTLS_ENTROPY_NV_SEED
+#define MBEDTLS_FS_IO
+#define MBEDTLS_PLATFORM_C
+#define MBEDTLS_PLATFORM_MEMORY
+#define MBEDTLS_MEMORY_BUFFER_ALLOC_C
+
+#if 0
+
 #define PSA_WANT_ALG_CBC_NO_PADDING             1
 #define PSA_WANT_ALG_CBC_PKCS7                  1
 #define PSA_WANT_ALG_CCM                        1
@@ -52,7 +86,7 @@
 #define PSA_WANT_ALG_CMAC                       1
 #define PSA_WANT_ALG_CFB                        1
 #define PSA_WANT_ALG_CHACHA20_POLY1305          1
-#define PSA_WANT_ALG_CTR                        1
+//#define PSA_WANT_ALG_CTR                        1
 #define PSA_WANT_ALG_DETERMINISTIC_ECDSA        1
 #define PSA_WANT_ALG_ECB_NO_PADDING             1
 #define PSA_WANT_ALG_ECDH                       1
@@ -113,7 +147,7 @@
 #define PSA_WANT_KEY_TYPE_HMAC                  1
 #define PSA_WANT_KEY_TYPE_AES                   1
 #define PSA_WANT_KEY_TYPE_ARIA                  1
-#define PSA_WANT_KEY_TYPE_CAMELLIA              1
+//#define PSA_WANT_KEY_TYPE_CAMELLIA              1
 #define PSA_WANT_KEY_TYPE_CHACHA20              1
 #define PSA_WANT_KEY_TYPE_ECC_PUBLIC_KEY        1
 #define PSA_WANT_KEY_TYPE_DH_PUBLIC_KEY         1
@@ -145,6 +179,7 @@
 #define PSA_WANT_KEY_TYPE_DH_KEY_PAIR_GENERATE  1
 //#define PSA_WANT_KEY_TYPE_DH_KEY_PAIR_DERIVE    1 /* Not supported */
 /** \} name SECTION Cryptographic mechanism selection (PSA API) */
+
 
 /**
  * \name SECTION: Platform abstraction layer
@@ -1023,7 +1058,7 @@
  *
  * Uncomment to enable the HMAC_DRBG random number generator.
  */
-#define MBEDTLS_HMAC_DRBG_C
+//#define MBEDTLS_HMAC_DRBG_C
 
 /**
  * \def MBEDTLS_PSA_CRYPTO_C
@@ -1541,7 +1576,7 @@
  *
  * Requires: The AES built-in implementation
  */
-//#define MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH
+#define MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH
 
 /*
  * Disable plain C implementation for AES.
@@ -1555,7 +1590,7 @@
  * necessary features. It will not build unless at least one of MBEDTLS_AESCE_C
  * and/or MBEDTLS_AESNI_C is enabled & present in the build.
  */
-//#define MBEDTLS_AES_USE_HARDWARE_ONLY
+#define MBEDTLS_AES_USE_HARDWARE_ONLY
 
 /**
  * \def MBEDTLS_BLOCK_CIPHER_NO_DECRYPT
@@ -1573,7 +1608,7 @@
  *          drivers/builtin/src/camellia.c
  *          drivers/builtin/src/cipher.c
  */
-//#define MBEDTLS_BLOCK_CIPHER_NO_DECRYPT
+#define MBEDTLS_BLOCK_CIPHER_NO_DECRYPT
 
 /**
  * \def MBEDTLS_CAMELLIA_SMALL_MEMORY
@@ -2016,4 +2051,8 @@
 /* Do not enable except for testing. Will be removed in a future minor version.
  */
 //#define TF_PSA_CRYPTO_ALLOW_REMOVED_MECHANISMS
+
+
+#endif
+
 #endif /* PSA_CRYPTO_CONFIG_H */
