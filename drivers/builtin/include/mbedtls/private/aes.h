@@ -31,6 +31,7 @@
 
 #include "tf-psa-crypto/build_info.h"
 #include "mbedtls/platform_util.h"
+#include "mbedtls/private/aesce_common.h"
 
 #include <stddef.h>
 #include <stdint.h>

@@ -17,16 +17,10 @@
 #include "tf_psa_crypto_common.h"
 
 #include "mbedtls/private/aes.h"
+#include "mbedtls/private/aesce_common.h"
 
 
-#if defined(MBEDTLS_AESCE_C) \
-    && defined(MBEDTLS_ARCH_IS_ARMV8_A) && defined(MBEDTLS_HAVE_NEON_INTRINSICS) \
-    && (defined(MBEDTLS_COMPILER_IS_GCC) || defined(__clang__) || defined(MSC_VER))
-
-/* MBEDTLS_AESCE_HAVE_CODE is defined if we have a suitable target platform, and a
- * potentially suitable compiler (compiler version & flags are not checked when defining
- * this). */
-#define MBEDTLS_AESCE_HAVE_CODE
+#if defined(MBEDTLS_AESCE_HAVE_CODE)
 
 #ifdef __cplusplus
 extern "C" {
