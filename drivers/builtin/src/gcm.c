@@ -569,6 +569,7 @@ int mbedtls_gcm_update(mbedtls_gcm_context *ctx,
     unsigned char *out_p = output;
     size_t offset;
     unsigned char ectr[16] = { 0 };
+    uint64_t len = ctx->len;
 
     if (output_size < input_length) {
         return MBEDTLS_ERR_GCM_BUFFER_TOO_SMALL;
@@ -589,16 +590,17 @@ int mbedtls_gcm_update(mbedtls_gcm_context *ctx,
 
     /* Total length is restricted to 2^39 - 256 bits, ie 2^36 - 2^5 bytes
      * Also check for possible overflow */
-    if (ctx->len + input_length < ctx->len ||
-        (uint64_t) ctx->len + input_length > 0xFFFFFFFE0ull) {
+    if (len + input_length < len ||
+        (uint64_t) len + input_length > 0xFFFFFFFE0ull) {
         return MBEDTLS_ERR_GCM_BAD_INPUT;
     }
 
-    if (ctx->len == 0 && ctx->add_len % 16 != 0) {
+    if (len == 0 && ctx->add_len % 16 != 0) {
         gcm_mult(ctx, ctx->buf, ctx->buf);
     }
 
-    offset = ctx->len % 16;
+    offset = len % 16;
+
     if (offset != 0) {
         size_t use_len = 16 - offset;
         if (use_len > input_length) {
@@ -606,25 +608,25 @@ int mbedtls_gcm_update(mbedtls_gcm_context *ctx,
         }
 
         if ((ret = gcm_mask(ctx, ectr, offset, use_len, p, out_p)) != 0) {
-            return ret;
+            goto done;
         }
 
         if (offset + use_len == 16) {
             gcm_mult(ctx, ctx->buf, ctx->buf);
         }
 
-        ctx->len += use_len;
+        len += use_len;
         input_length -= use_len;
         p += use_len;
         out_p += use_len;
     }
 
-    ctx->len += input_length;
+    len += input_length;
 
     while (input_length >= 16) {
         gcm_incr(ctx->y);
         if ((ret = gcm_mask(ctx, ectr, 0, 16, p, out_p)) != 0) {
-            return ret;
+            goto done;
         }
 
         gcm_mult(ctx, ctx->buf, ctx->buf);
@@ -637,12 +639,16 @@ int mbedtls_gcm_update(mbedtls_gcm_context *ctx,
     if (input_length > 0) {
         gcm_incr(ctx->y);
         if ((ret = gcm_mask(ctx, ectr, 0, input_length, p, out_p)) != 0) {
-            return ret;
+            goto done;
         }
     }
 
+    ret = 0;
+
+done:
     mbedtls_platform_zeroize(ectr, sizeof(ectr));
-    return 0;
+    ctx->len = len;
+    return ret;
 }
 
 int mbedtls_gcm_finish(mbedtls_gcm_context *ctx,
