@@ -160,6 +160,12 @@ int mbedtls_aesce_has_support_impl(void)
 
 #endif /* defined(__linux__) && !defined(MBEDTLS_AES_USE_HARDWARE_ONLY) */
 
+#if defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
+#define KEY_OFFSET(nr) (0)
+#else
+#define KEY_OFFSET(nr) ((14 - (nr)) * 16)
+#endif
+
 /* Single round of AESCE encryption */
 #define AESCE_ENCRYPT_ROUND(k)          \
     block = vaeseq_u8(block, keys[k]);  \
@@ -260,11 +266,16 @@ static uint8x16_t aesce_decrypt_block(uint8x16_t block,
 #endif
 
 static void mbedtls_aesce_load_keys(mbedtls_aes_context *ctx, uint8x16_t *vkeys) {
-    int nr = MBEDTLS_AES_GET_NR(ctx);
-    unsigned char *keys = (unsigned char *) (ctx->buf + MBEDTLS_AES_GET_RK_OFFSET(ctx));
-    for (int i = 0; i < nr + 1; i++) {
-        vkeys[i + 14 - nr] = vld1q_u8(&keys[i * 16]);
+    unsigned char *keys = (unsigned char *) ctx->buf;
+#if defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
+    for (unsigned i = 0; i <= 10; i++) {
+        vkeys[i + 4] = vld1q_u8(&keys[i * 16]);
     }
+#else
+    for (unsigned i = 0; i <= 14; i++) {
+        vkeys[i] = vld1q_u8(&keys[i * 16]);
+    }
+#endif
 }
 
 /*
@@ -276,12 +287,12 @@ int mbedtls_aesce_crypt_ecb(mbedtls_aes_context *ctx,
                             unsigned char output[16])
 {
     uint8x16_t block = vld1q_u8(&input[0]);
-    int nr = MBEDTLS_AES_GET_NR(ctx);
 
 #if !defined(MBEDTLS_BLOCK_CIPHER_NO_DECRYPT)
-    unsigned char *keys = (unsigned char *) (ctx->buf + MBEDTLS_AES_GET_RK_OFFSET(ctx));
+    unsigned char *keys = (unsigned char *) ctx->buf;
+    int nr = MBEDTLS_AES_GET_NR(ctx);
     if (mode == MBEDTLS_AES_DECRYPT) {
-        block = aesce_decrypt_block(block, keys, nr);
+        block = aesce_decrypt_block(block, keys + KEY_OFFSET(nr), nr);
     } else
 #else
     (void) mode;
@@ -289,7 +300,7 @@ int mbedtls_aesce_crypt_ecb(mbedtls_aes_context *ctx,
     {
         uint8x16_t vkeys[15];
         mbedtls_aesce_load_keys(ctx, vkeys);
-        block = aesce_encrypt_block(block, vkeys, nr);
+        block = aesce_encrypt_block(block, vkeys, MBEDTLS_AES_GET_NR(ctx));
     }
     vst1q_u8(&output[0], block);
 
@@ -304,6 +315,9 @@ void mbedtls_aesce_inverse_key(unsigned char *invkey,
                                const unsigned char *fwdkey,
                                int nr)
 {
+    invkey += KEY_OFFSET(nr);
+    fwdkey += KEY_OFFSET(nr);
+
     int i, j;
     j = nr;
     vst1q_u8(invkey, vld1q_u8(fwdkey + j * 16));
@@ -339,6 +353,17 @@ int mbedtls_aesce_setkey_enc(unsigned char *rk,
                              const unsigned char *key,
                              const size_t key_bit_length)
 {
+#if defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
+    MBEDTLS_ASSUME(key_bit_length == 128);
+#else
+    // ensure consistent layout (ie if 128 or 192-bit keys, the leading
+    // 32 or 64 bytes are skipped, so the remaining keys always sit in the same
+    // part of ctx->buf)
+    // this layout simplifies loading into NEON registers, which helps
+    // size and perf
+    rk += (256 - key_bit_length) >> 1;
+#endif
+
     static uint8_t const rcon[] = { 0x01, 0x02, 0x04, 0x08, 0x10,
                                     0x20, 0x40, 0x80, 0x1b, 0x36 };
     /* See https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.197.pdf
