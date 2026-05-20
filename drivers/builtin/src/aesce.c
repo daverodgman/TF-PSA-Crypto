@@ -643,6 +643,61 @@ NO_INLINE void mbedtls_aesce_gcm_mult(unsigned char c[16],
     vst1q_u8(&c[0], vc);
 }
 
+MBEDTLS_OPTIMIZE_FOR_PERFORMANCE
+void mbedtls_aesce_gcm_update_block_partial(
+    mbedtls_aes_context *aes_ctx,
+    mbedtls_gcm_context *ctx,
+    const uint8_t *input,
+    uint8_t *output,
+    unsigned offset, unsigned len, uint8_t scratch[32]
+    )
+{
+    MBEDTLS_ASSUME(len > 0);
+    int nr = MBEDTLS_AES_GET_NR(aes_ctx);
+    const uint8x16_t *vkeys = aes_ctx->vkeys;
+
+    uint8x16_t vctr_ne  = MBEDTLS_IS_BIG_ENDIAN ? vld1q_u8(ctx->y) : vrev32q_u8(vld1q_u8(ctx->y));
+    // only increment if offset == 0
+    const uint32x4_t k1 = vsetq_lane_u32(!offset, vdupq_n_u32(0), 3);
+    vctr_ne = vreinterpretq_u8_u32(vaddq_u32(vreinterpretq_u32_u8(vctr_ne), k1));
+    uint8x16_t vctr_be = MBEDTLS_IS_BIG_ENDIAN ? vctr_ne : vrev32q_u8(vctr_ne);
+    vst1q_u8(ctx->y, vctr_be);
+    uint8x16_t vectr = aesce_encrypt_block(vctr_be, vkeys, nr);
+
+#if MBEDTLS_AESCE_OPTIMISE_FOR_SIZE == 1
+    // in size-optimised mode, add a less-slow path to avoid perf regression
+    // adds around 70b but doubles performance compared to not having it.
+    if (len == 16) {
+        uint8x16_t vinput = vld1q_u8(input);
+        uint8x16_t vbuf = vld1q_u8(ctx->buf);
+        uint8x16_t voutput = veorq_u8(vectr, vinput);
+        vbuf = veorq_u8(vbuf, (ctx->mode == MBEDTLS_GCM_ENCRYPT) ? voutput : vinput);
+        vst1q_u8(output, voutput);
+        vst1q_u8(ctx->buf, vbuf);
+    } else
+#endif
+    {
+        uint8_t *out16, *in16;
+        in16  = &scratch[0];
+        out16 = &scratch[16];
+        memcpy(in16 + offset, input, len);
+
+        uint8x16_t vinput = vld1q_u8(in16);
+        uint8x16_t voutput = veorq_u8(vectr, vinput);
+
+        vst1q_u8(out16, voutput);
+        memcpy(output, out16 + offset, len);
+
+#if MBEDTLS_GCM_DECRYPT != 0 || MBEDTLS_GCM_ENCRYPT != 1
+#error This code assumes MBEDTLS_GCM_DECRYPT == 0 && MBEDTLS_GCM_ENCRYPT == 1
+#endif
+        const uint8_t *p = &scratch[ctx->mode * 16]; // ciphertext pointer
+        MBEDTLS_XOR_SMALL(ctx->buf + offset, ctx->buf + offset, p + offset, len);
+    }
+
+    mbedtls_aesce_gcm_mult(ctx->buf, ctx->buf, &(ctx)->aesce_H[(offset + len) & 16]);
+}
+
 #define MBEDTLS_AESCE_GCM_MULTIBLOCK 4
 
 MBEDTLS_OPTIMIZE_FOR_PERFORMANCE
@@ -741,27 +796,27 @@ void mbedtls_aesce_gcm_update_blocks(
         output += 16 * MBEDTLS_AESCE_GCM_MULTIBLOCK;
     }
 
-    uint8x16_t vh = vrbitq_u8(vld1q_u8(&ctx->aesce_H[16]));
-    size_t n = blocks % MBEDTLS_AESCE_GCM_MULTIBLOCK;
-    while (n--) {
-        vctr_ne = vreinterpretq_u8_u32(vaddq_u32(vreinterpretq_u32_u8(vctr_ne), k1));
-        uint8x16_t vctr_be = MBEDTLS_IS_BIG_ENDIAN ? vctr_ne : vrev32q_u8(vctr_ne);
-        uint8x16_t vin_tail = vld1q_u8(input);
-        uint8x16_t ve_tail = aesce_encrypt_block_inline(vctr_be, vkeys, nr);
-        uint8x16_t vout_tail = veorq_u8(vin_tail, ve_tail);
-        uint8x16_t vct = (ctx->mode == MBEDTLS_GCM_ENCRYPT) ? vout_tail : vin_tail;
-
-        vst1q_u8(output, vout_tail);
-        vbuf = veorq_u8(vbuf, vct);
-        vbuf = mbedtls_aesce_gcm_mult_impl_inline(vbuf, vh);
-
-        input += 16;
-        output += 16;
-    }
-
     uint8x16_t vctr_be = MBEDTLS_IS_BIG_ENDIAN ? vctr_ne : vrev32q_u8(vctr_ne);
     vst1q_u8(ctx->buf, vbuf);
     vst1q_u8(ctx->y, vctr_be);
+
+    size_t n = blocks % MBEDTLS_AESCE_GCM_MULTIBLOCK;
+    if (n > 0) {
+        uint8_t scratch[32];
+        while (n--) {
+            mbedtls_aesce_gcm_update_block_partial(
+                aes_ctx, ctx,
+                input,
+                output,
+                0,
+                16,
+                scratch
+            );
+            input += 16;
+            output += 16;
+        }
+        mbedtls_platform_zeroize(scratch, 32);
+    }
 }
 
 #endif /* MBEDTLS_GCM_C */

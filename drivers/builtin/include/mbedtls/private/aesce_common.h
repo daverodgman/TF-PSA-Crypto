@@ -20,4 +20,11 @@
 #define MBEDTLS_AESCE_HAVE_CODE
 #endif
 
+/*
+ * If set to 1, this saves around 800b of code size for AESCE AES-GCM.
+ */
+#if !defined(MBEDTLS_AESCE_OPTIMISE_FOR_SIZE)
+#define MBEDTLS_AESCE_OPTIMISE_FOR_SIZE 0
+#endif
+
 #endif /* TF_PSA_CRYPTO_MBEDTLS_PRIVATE_AESCE_COMMON_H */

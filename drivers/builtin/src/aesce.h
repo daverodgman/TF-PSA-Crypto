@@ -104,6 +104,28 @@ void mbedtls_aesce_gcm_update_blocks(
     unsigned char *output,
     size_t blocks);
 
+#endif
+
+/**
+ * \brief          Internal AES-GCM partial block encryption and decryption
+ *
+ * \param aes_ctx  AES context
+ * \param ctx      GCM context
+ * \param input    16-byte input block
+ * \param output   16-byte output block
+ * \param offset   Offset within block to start from
+ * \param length   Length in bytes such that \p offset + \p len <= 16
+ */
+void mbedtls_aesce_gcm_update_block_partial(
+    mbedtls_aes_context *aes_ctx,
+    mbedtls_gcm_context *ctx,
+    const uint8_t *input,
+    uint8_t *output,
+    unsigned offset,
+    unsigned length,
+    uint8_t scratch[32]
+    );
+
 #if !defined(MBEDTLS_BLOCK_CIPHER_NO_DECRYPT)
 /**
  * \brief           Internal round key inversion. This function computes
