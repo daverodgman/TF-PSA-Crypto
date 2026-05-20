@@ -172,6 +172,8 @@ int mbedtls_aesce_has_support_impl(void)
     #define NO_INLINE
 #endif
 
+#if defined MBEDTLS_AES_C
+
 /* Single round of AESCE encryption */
 #define AESCE_ENCRYPT_ROUND(k)          \
     block = vaeseq_u8(block, vkeys[k]);  \
@@ -217,6 +219,7 @@ static NO_INLINE uint8x16_t aesce_encrypt_block(uint8x16_t block,
     return aesce_encrypt_block_inline(block, vkeys, nr);
 }
 
+#if !defined(MBEDTLS_BLOCK_CIPHER_NO_DECRYPT)
 /* Single round of AESCE decryption
  *
  * AES AddRoundKey, SubBytes, ShiftRows
@@ -247,7 +250,6 @@ static NO_INLINE uint8x16_t aesce_encrypt_block(uint8x16_t block,
     AESCE_DECRYPT_ROUND(k);             \
     AESCE_DECRYPT_ROUND(k + 1)
 
-#if !defined(MBEDTLS_BLOCK_CIPHER_NO_DECRYPT)
 static uint8x16_t aesce_decrypt_block(uint8x16_t block,
                                       const uint8x16_t *vkeys,
                                       int rounds)
@@ -277,7 +279,7 @@ static uint8x16_t aesce_decrypt_block(uint8x16_t block,
     block = veorq_u8(block, vkeys[14]);
     return block;
 }
-#endif
+#endif // MBEDTLS_BLOCK_CIPHER_NO_DECRYPT
 
 static void mbedtls_aesce_load_keys(mbedtls_aes_context *ctx, uint8x16_t *vkeys)
 {
@@ -426,6 +428,8 @@ int mbedtls_aesce_setkey_enc(mbedtls_aes_context *ctx,
 
     return 0;
 }
+
+#endif
 
 #if defined(MBEDTLS_GCM_C)
 
@@ -643,6 +647,28 @@ NO_INLINE void mbedtls_aesce_gcm_mult(unsigned char c[16],
     vst1q_u8(&c[0], vc);
 }
 
+void mbedtls_aesce_gcm_gen_table(mbedtls_gcm_context *ctx, uint8_t hash_key[16])
+{
+    /*
+     * Set up H so that the first 8 bytes can be used by gcm_mult as the identity,
+     * and the next 8 bytes are the hash key. This allows update_block_partial
+     * to avoid a conditional when (maybe) multiplying by multiplying by
+     * H[(offset + len) & 16] - ie multiply by hash key iff (offset + len) == 16.
+     *
+     * First 16 bytes - identity. Note that pmull operates over data which is
+     * bit-reversed as if vrbitq_u8 were applied, i.e.
+     * [1, 0, 0, ... ] is represented as [128, 0, 0, ...].
+     */
+    uint8x16_t vh = vdupq_n_u8(0);
+    vst1q_u8(&ctx->aesce_H[0], vh);
+    ctx->aesce_H[0] = 128;
+    // next 16 bytes - hash key
+    vh = vld1q_u8(hash_key);
+    vst1q_u8(&ctx->aesce_H[16], vh);
+}
+
+#if defined(MBEDTLS_AES_C)
+
 MBEDTLS_OPTIMIZE_FOR_PERFORMANCE
 void mbedtls_aesce_gcm_update_block_partial(
     mbedtls_aes_context *aes_ctx,
@@ -818,6 +844,8 @@ void mbedtls_aesce_gcm_update_blocks(
         mbedtls_platform_zeroize(scratch, 32);
     }
 }
+
+#endif // MBEDTLS_AES_C
 
 #endif /* MBEDTLS_GCM_C */
 

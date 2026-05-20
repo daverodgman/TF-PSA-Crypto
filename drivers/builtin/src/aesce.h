@@ -51,6 +51,43 @@ int mbedtls_aesce_has_support_impl(void);
 
 #endif /* defined(__linux__) && !defined(MBEDTLS_AES_USE_HARDWARE_ONLY) */
 
+
+
+#if defined MBEDTLS_GCM_C
+
+/**
+ * \brief          Internal GCM multiplication: c = a * b in GF(2^128)
+ *
+ * \note           This function is only for internal use by other library
+ *                 functions; you must not call it directly.
+ *
+ * \param c        Result
+ * \param a        First operand
+ * \param b        Second operand
+ *
+ * \note           Both operands and result are bit strings interpreted as
+ *                 elements of GF(2^128) as per the GCM spec.
+ */
+void mbedtls_aesce_gcm_mult(unsigned char c[16],
+                            const unsigned char a[16],
+                            const unsigned char b[16]);
+
+/**
+ * \brief          Initialise data for AES GCM computations.
+ *
+ * \note           This function is only for internal use by other library
+ *                 functions; you must not call it directly.
+ *
+ * \param ctx      GCM ctx
+ * \param hash_key Hash key to be used by GCM (ie result of encrypting a block
+ *                 of zeros).
+ */
+void mbedtls_aesce_gcm_gen_table(mbedtls_gcm_context *ctx,
+                                 uint8_t hash_key[16]);
+
+#endif // MBEDTLS_GCM_C
+
+#if defined(MBEDTLS_AES_C)
 /**
  * \brief          Internal AES-ECB block encryption and decryption
  *
@@ -70,24 +107,6 @@ int mbedtls_aesce_crypt_ecb(mbedtls_aes_context *ctx,
                             unsigned char output[16]);
 
 /**
- * \brief          Internal GCM multiplication: c = a * b in GF(2^128)
- *
- * \note           This function is only for internal use by other library
- *                 functions; you must not call it directly.
- *
- * \param c        Result
- * \param a        First operand
- * \param b        Second operand
- *
- * \note           Both operands and result are bit strings interpreted as
- *                 elements of GF(2^128) as per the GCM spec.
- */
-void mbedtls_aesce_gcm_mult(unsigned char c[16],
-                            const unsigned char a[16],
-                            const unsigned char b[16]);
-
-
-/**
  * \brief          Internal AES-GCM encryption and decryption over multiple
  *                 complete blocks.
  *
@@ -103,8 +122,6 @@ void mbedtls_aesce_gcm_update_blocks(
     const unsigned char *input,
     unsigned char *output,
     size_t blocks);
-
-#endif
 
 /**
  * \brief          Internal AES-GCM partial block encryption and decryption
@@ -153,6 +170,8 @@ int mbedtls_aesce_setkey_enc(mbedtls_aes_context *ctx,
                              unsigned char *rk,
                              const unsigned char *key,
                              size_t key_bit_length);
+
+#endif // MBEDTLS_AES_C
 
 #ifdef __cplusplus
 }
