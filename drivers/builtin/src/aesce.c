@@ -776,12 +776,12 @@ void mbedtls_aesce_gcm_update_blocks(
         // helps AES-256 by around 10%
         for (unsigned round = 14 - nr; round < 13; round++) {
             ve[0] = vaeseq_u8(ve[0], vkeys[round]);
-            ve[1] = vaeseq_u8(ve[1], vkeys[round]);
-            ve[2] = vaeseq_u8(ve[2], vkeys[round]);
-            ve[3] = vaeseq_u8(ve[3], vkeys[round]);
             ve[0] = vaesmcq_u8(ve[0]);
+            ve[1] = vaeseq_u8(ve[1], vkeys[round]);
             ve[1] = vaesmcq_u8(ve[1]);
+            ve[2] = vaeseq_u8(ve[2], vkeys[round]);
             ve[2] = vaesmcq_u8(ve[2]);
+            ve[3] = vaeseq_u8(ve[3], vkeys[round]);
             ve[3] = vaesmcq_u8(ve[3]);
         }
 
