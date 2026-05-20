@@ -382,7 +382,12 @@ int mbedtls_aesce_setkey_enc(mbedtls_aes_context *ctx,
         round_key_len_in_words * (rounds_needed + 1);       /* Nb*(Nr+1) */
     const uint32_t *rko_end = (uint32_t *) rk + round_keys_len_in_words;
 
-    memcpy(rk, key, key_len_in_words * 4);
+    uint8x16_t vk = vld1q_u8(key);
+    vst1q_u8(rk, vk);
+#if !defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
+    vk = vld1q_u8(key + (key_bit_length - 128)/8);
+    vst1q_u8(rk + (key_bit_length - 128)/8, vk);
+#endif
 
     for (uint32_t *rki = (uint32_t *) rk;
          rki + key_len_in_words < rko_end;
@@ -397,26 +402,15 @@ int mbedtls_aesce_setkey_enc(mbedtls_aes_context *ctx,
         rko[1] = rko[0] ^ rki[1];
         rko[2] = rko[1] ^ rki[2];
         rko[3] = rko[2] ^ rki[3];
-        if (rko + key_len_in_words > rko_end) {
-            /* Do not write overflow words.*/
-            continue;
-        }
 #if !defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
-        switch (key_bit_length) {
-            case 128:
-                break;
-            case 192:
-                rko[4] = rko[3] ^ rki[4];
-                rko[5] = rko[4] ^ rki[5];
-                break;
-            case 256:
-                rko[4] = aes_sub_word(rko[3]) ^ rki[4];
-                rko[5] = rko[4] ^ rki[5];
-                rko[6] = rko[5] ^ rki[6];
-                rko[7] = rko[6] ^ rki[7];
-                break;
+        rko[4] = rko[3] ^ rki[4];
+        if (key_bit_length == 256) {
+            rko[4] = aes_sub_word(rko[3]) ^ rki[4];
         }
-#endif /* !MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH */
+        rko[5] = rko[4] ^ rki[5];
+        rko[6] = rko[5] ^ rki[6];
+        rko[7] = rko[6] ^ rki[7];
+#endif
     }
 
     mbedtls_aesce_load_keys(ctx, ctx->vkeys);
