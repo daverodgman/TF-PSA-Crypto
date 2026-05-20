@@ -160,6 +160,18 @@ int mbedtls_aesce_has_support_impl(void)
 
 #endif /* defined(__linux__) && !defined(MBEDTLS_AES_USE_HARDWARE_ONLY) */
 
+/* prevent inlining */
+#if defined(_MSC_VER)
+  #define NO_INLINE __declspec(noinline)
+#elif defined(__clang__)
+    #define NO_INLINE __attribute__((noinline))
+#elif defined(__GNUC__) && (MBEDTLS_GCC_VERSION >= 30100)
+    #define NO_INLINE __attribute__((noinline))
+#endif
+#if !defined(NO_INLINE)
+    #define NO_INLINE
+#endif
+
 /* Single round of AESCE encryption */
 #define AESCE_ENCRYPT_ROUND(k)          \
     block = vaeseq_u8(block, vkeys[k]);  \
@@ -169,9 +181,10 @@ int mbedtls_aesce_has_support_impl(void)
     AESCE_ENCRYPT_ROUND(k);             \
     AESCE_ENCRYPT_ROUND(k + 1)
 
-static uint8x16_t aesce_encrypt_block(uint8x16_t block,
-                                      const uint8x16_t *vkeys,
-                                      int nr)
+
+static inline uint8x16_t aesce_encrypt_block_inline(uint8x16_t block,
+                                                    const uint8x16_t *vkeys,
+                                                    int nr)
 {
     /* 10, 12 or 14 rounds. Unroll loop. */
 #if defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
@@ -195,6 +208,13 @@ static uint8x16_t aesce_encrypt_block(uint8x16_t block,
     block = vaeseq_u8(block, vkeys[13]);
     block = veorq_u8(block, vkeys[14]);
     return block;
+}
+
+static NO_INLINE uint8x16_t aesce_encrypt_block(uint8x16_t block,
+                                                const uint8x16_t *vkeys,
+                                                const int nr)
+{
+    return aesce_encrypt_block_inline(block, vkeys, nr);
 }
 
 /* Single round of AESCE decryption
@@ -259,7 +279,8 @@ static uint8x16_t aesce_decrypt_block(uint8x16_t block,
 }
 #endif
 
-static inline void mbedtls_aesce_load_keys(mbedtls_aes_context *ctx, uint8x16_t *vkeys) {
+static void mbedtls_aesce_load_keys(mbedtls_aes_context *ctx, uint8x16_t *vkeys)
+{
     uint8_t *p = (uint8_t *) ctx->buf;
 #if defined(MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH)
     for (unsigned i = 0; i <= 10; i++) {
