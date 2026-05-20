@@ -643,6 +643,47 @@ NO_INLINE void mbedtls_aesce_gcm_mult(unsigned char c[16],
     vst1q_u8(&c[0], vc);
 }
 
+#define MBEDTLS_AESCE_GCM_MULTIBLOCK 4
+
+MBEDTLS_OPTIMIZE_FOR_PERFORMANCE
+void mbedtls_aesce_gcm_update_blocks(
+    mbedtls_aes_context *aes_ctx,
+    mbedtls_gcm_context *ctx,
+    const unsigned char *input,
+    unsigned char *output,
+    size_t blocks)
+{
+    const uint8x16_t *vkeys = aes_ctx->vkeys;
+
+    MBEDTLS_MAYBE_UNUSED
+    const int nr = MBEDTLS_AES_GET_NR(aes_ctx);
+
+    const uint32x4_t k1 = vsetq_lane_u32(1, vdupq_n_u32(0), 3);
+    uint8x16_t vbuf = vld1q_u8(ctx->buf);
+    uint8x16_t vh = vrbitq_u8(vld1q_u8(&ctx->aesce_H[16]));
+    uint8x16_t vctr_ne  = MBEDTLS_IS_BIG_ENDIAN ? vld1q_u8(ctx->y) : vrev32q_u8(vld1q_u8(ctx->y));
+
+    while (blocks--) {
+        vctr_ne = vreinterpretq_u8_u32(vaddq_u32(vreinterpretq_u32_u8(vctr_ne), k1));
+        uint8x16_t vctr_be = MBEDTLS_IS_BIG_ENDIAN ? vctr_ne : vrev32q_u8(vctr_ne);
+        uint8x16_t vin = vld1q_u8(input);
+        uint8x16_t ve = aesce_encrypt_block_inline(vctr_be, vkeys, nr);
+        uint8x16_t vout = veorq_u8(vin, ve);
+        uint8x16_t vct = (ctx->mode == MBEDTLS_GCM_ENCRYPT) ? vout : vin;
+
+        vst1q_u8(output, vout);
+        vbuf = veorq_u8(vbuf, vct);
+        vbuf = mbedtls_aesce_gcm_mult_impl_inline(vbuf, vh);
+
+        input += 16;
+        output += 16;
+    }
+
+    uint8x16_t vctr_be = MBEDTLS_IS_BIG_ENDIAN ? vctr_ne : vrev32q_u8(vctr_ne);
+    vst1q_u8(ctx->buf, vbuf);
+    vst1q_u8(ctx->y, vctr_be);
+}
+
 #endif /* MBEDTLS_GCM_C */
 
 #if defined(MBEDTLS_POP_TARGET_PRAGMA)
