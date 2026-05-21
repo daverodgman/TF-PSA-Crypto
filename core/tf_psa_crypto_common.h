@@ -193,6 +193,8 @@ static inline const unsigned char *mbedtls_buffer_offset_const(
     return p == NULL ? NULL : p + n;
 }
 
+
+
 /* Always inline mbedtls_xor() for similar reasons as mbedtls_xor_no_simd(). */
 #if defined(__IAR_SYSTEMS_ICC__)
 #pragma inline = forced
