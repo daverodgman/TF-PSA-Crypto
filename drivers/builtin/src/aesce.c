@@ -611,31 +611,37 @@ static inline uint8x16_t pmull_high(uint8x16_t a, uint8x16_t b)
  * multiplies to generate a 128b.
  *
  * `poly_mult_128` executes polynomial multiplication and outputs 256b that
- * represented by 3 128b due to code size optimization.
+ * represented by 4x128b. The middle two values, ret.val[1] and ret.val[2]
+ * need to be xor'd together to get the result.
  *
  * Output layout:
  * |            |             |             |
  * |------------|-------------|-------------|
  * | ret.val[0] | h3:h2:00:00 | high   128b |
  * | ret.val[1] |   :m2:m1:00 | middle 128b |
- * | ret.val[2] |   :  :l1:l0 | low    128b |
+ * | ret.val[2] |   :m2:m1:00 | middle 128b |
+ * | ret.val[3] |   :  :l1:l0 | low    128b |
  */
-static inline uint8x16x3_t poly_mult_128(uint8x16_t a, uint8x16_t b)
+static inline uint8x16x4_t poly_mult_128(uint8x16_t a, uint8x16_t b)
 {
-    uint8x16x3_t ret;
-    uint8x16_t h, m, l; /* retval high/middle/low */
+    uint8x16x4_t ret;
+    uint8x16_t h, l; /* retval high/low */
     uint8x16_t c, d, e;
 
+    c = vextq_u8(b, b, 8);                      /*      :c1:c0 = b0:b1 */
     h = pmull_high(a, b);                       /* h3:h2:00:00 = a1*b1 */
     l = pmull_low(a, b);                        /*   :  :l1:l0 = a0*b0 */
-    c = vextq_u8(b, b, 8);                      /*      :c1:c0 = b0:b1 */
     d = pmull_high(a, c);                       /*   :d2:d1:00 = a1*b0 */
     e = pmull_low(a, c);                        /*   :e2:e1:00 = a0*b1 */
-    m = veorq_u8(d, e);                         /*   :m2:m1:00 = d + e */
 
     ret.val[0] = h;
-    ret.val[1] = m;
-    ret.val[2] = l;
+    // d and e should be xor'd together - this is left to the caller
+    // as it is sometimes possible to get some efficiencies by combining with
+    // other xors needed via veor3q
+    ret.val[1] = d;
+    ret.val[2] = e;
+    ret.val[3] = l;
+
     return ret;
 }
 
@@ -653,10 +659,8 @@ static inline uint8x16x3_t poly_mult_128(uint8x16_t a, uint8x16_t b)
  * simply multiply the higher part of the operand by r(z) and add it to l(z). If
  * the result is still larger than 128 bits, we reduce again.
  */
-static inline uint8x16_t poly_mult_reduce(uint8x16x3_t input)
+static inline uint8x16_t poly_mult_reduce(uint8x16x4_t input)
 {
-    uint8x16_t const ZERO = vdupq_n_u8(0);
-
     uint64x2_t r = vreinterpretq_u64_u8(vdupq_n_u8(0x87));
 #if defined(__GNUC__)
     /* use 'asm' as an optimisation barrier to prevent loading MODULO from
@@ -665,43 +669,37 @@ static inline uint8x16_t poly_mult_reduce(uint8x16x3_t input)
     asm volatile ("" : "+w" (r));
 #endif
     uint8x16_t const MODULO = vreinterpretq_u8_u64(vshrq_n_u64(r, 64 - 8));
-    uint8x16_t h, m, l; /* input high/middle/low 128b */
-    uint8x16_t c, d, e, f, g, n, o;
+    uint8x16_t h, l; /* input high/middle/low 128b */
+    uint8x16_t c, d, e, f, g, n;//, o;
     h = input.val[0];            /* h3:h2:00:00                          */
-    m = input.val[1];            /*   :m2:m1:00                          */
-    l = input.val[2];            /*   :  :l1:l0                          */
-    c = pmull_high(h, MODULO);   /*   :c2:c1:00 = reduction of h3        */
+    l = input.val[3];            /*   :  :l1:l0                          */
+    c = pmull_high(h, MODULO);   /*   :   c2:c1:00 = reduction of h3     */
     d = pmull_low(h, MODULO);    /*   :  :d1:d0 = reduction of h2        */
-    e = veorq_u8(c, m);          /*   :e2:e1:00 = m2:m1:00 + c2:c1:00    */
+    e = VEOR3Q_U8(c, input.val[1], input.val[2]);  /*   :e2:e1:00 = m2:m1:00 + c2:c1:00    */
+    uint8x16_t const ZERO = vdupq_n_u8(0);
     f = pmull_high(e, MODULO);   /*   :  :f1:f0 = reduction of e2        */
     g = vextq_u8(ZERO, e, 8);    /*   :  :g1:00 = e1:00                  */
     n = veorq_u8(d, l);          /*   :  :n1:n0 = d1:d0 + l1:l0          */
-    o = veorq_u8(n, f);          /*       o1:o0 = f1:f0 + n1:n0          */
-    return veorq_u8(o, g);       /*             = o1:o0 + g1:00          */
+    return VEOR3Q_U8(n, f, g);   /*   :  f1:f0 + n1:n0 + g1:00          */
+}
+
+// Having a not-inlined copy helps code-size on non-perf-sensitive paths
+static NO_INLINE uint8x16_t poly_mult_multiply_and_reduce(uint8x16_t a, uint8x16_t b)
+{
+    return poly_mult_reduce(poly_mult_128(a, b));
 }
 
 /*
  * GCM multiplication: c = a times b in GF(2^128)
  */
-static inline uint8x16_t mbedtls_aesce_gcm_mult_impl_inline(
-                            const uint8x16_t a,
-                            const uint8x16_t b)
-{
-    uint8x16_t va, vb, vc;
-    va = vrbitq_u8(a);
-    vb = b; // assume b has already had vrbitq_u8 applied
-    vc = vrbitq_u8(poly_mult_reduce(poly_mult_128(va, vb)));
-    return vc;
-}
-
 NO_INLINE void mbedtls_aesce_gcm_mult(unsigned char c[16],
                                       const unsigned char a[16],
                                       const unsigned char b[16])
 {
     uint8x16_t va, vb, vc;
-    va = vld1q_u8(&a[0]);
+    va = vrbitq_u8(vld1q_u8(&a[0]));
     vb = vrbitq_u8(vld1q_u8(&b[0]));
-    vc = mbedtls_aesce_gcm_mult_impl_inline(va, vb);
+    vc = vrbitq_u8(poly_mult_multiply_and_reduce(va, vb));
     vst1q_u8(&c[0], vc);
 }
 
@@ -740,7 +738,7 @@ void mbedtls_aesce_gcm_gen_table(mbedtls_gcm_context *ctx, uint8_t hash_key[16])
         uint8x16_t a = ctx->vghash_4.val[i>>1];
         i++;
         uint8x16_t b = ctx->vghash_4.val[i>>1];
-        ctx->vghash_4.val[i] = poly_mult_reduce(poly_mult_128(a, b));
+        ctx->vghash_4.val[i] = poly_mult_multiply_and_reduce(a, b);
     }
 #endif
 }
@@ -820,22 +818,22 @@ static inline uint8x16_t ghash_update_x4(uint8x16_t X,
      * especially for GCC.
      */
 
-    // Unreduced accumulation in 128x128 "wide" representation (x3)
-    uint8x16x3_t acc = poly_mult_128(vrbitq_u8(X),  vh.val[3]);
+    uint8x16x4_t acc = poly_mult_128(vrbitq_u8(X),  vh.val[3]);
 
-    // Convert operands into PMULL-domain
-    uint8x16x3_t a = poly_mult_128(vrbitq_u8(Y[0]), vh.val[3]);
-    uint8x16x3_t b = poly_mult_128(vrbitq_u8(Y[1]), vh.val[2]);
+    uint8x16x4_t a = poly_mult_128(vrbitq_u8(Y[0]), vh.val[3]);
+    uint8x16x4_t b = poly_mult_128(vrbitq_u8(Y[1]), vh.val[2]);
     acc.val[0] = VEOR3Q_U8(acc.val[0], a.val[0], b.val[0]);
     acc.val[1] = VEOR3Q_U8(acc.val[1], a.val[1], b.val[1]);
-    uint8x16x3_t c = poly_mult_128(vrbitq_u8(Y[2]), vh.val[1]);
     acc.val[2] = VEOR3Q_U8(acc.val[2], a.val[2], b.val[2]);
-    uint8x16x3_t d = poly_mult_128(vrbitq_u8(Y[3]), vh.val[0]);
+    acc.val[3] = VEOR3Q_U8(acc.val[3], a.val[3], b.val[3]);
+
+    uint8x16x4_t c = poly_mult_128(vrbitq_u8(Y[2]), vh.val[1]);
+    uint8x16x4_t d = poly_mult_128(vrbitq_u8(Y[3]), vh.val[0]);
     acc.val[0] = VEOR3Q_U8(acc.val[0], c.val[0], d.val[0]);
     acc.val[1] = VEOR3Q_U8(acc.val[1], c.val[1], d.val[1]);
     acc.val[2] = VEOR3Q_U8(acc.val[2], c.val[2], d.val[2]);
+    acc.val[3] = VEOR3Q_U8(acc.val[3], c.val[3], d.val[3]);
 
-    // Single reduction for the whole group, then convert back
     uint8x16_t Rr = poly_mult_reduce(acc);
     return vrbitq_u8(Rr);
 }
