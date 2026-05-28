@@ -1,0 +1,735 @@
+#!/usr/bin/env python3
+
+import os
+import time
+import argparse
+import datetime
+import json
+import shutil
+import subprocess
+import itertools
+import statistics
+
+CFLAGS    = "-Wno-unused-parameter -Wno-unused-variable -Os "
+COMPILERS = ["clang-17"] #, "gcc-15"] # , "gcc-15", "clang-21" ]
+OPTS      = []
+OPT_FLAG  = "-Os"
+
+
+BENCH_ITERS = 25
+BENCH_SLEEP = 1#.25
+
+ALWAYS_FAST_CLEAN = True
+ROOT       = "/Users/davrod01/code/mbedtls/TF-PSA-Crypto"
+BUILD_DIR  = f"{ROOT}/build"
+OPTS_FILE  = f"{ROOT}/drivers/builtin/src/opts.h"
+TEST_SUITES = [ "test_suite_aes.ctr", "test_suite_aes.ecb", "test_suite_gcm.aes128_de", "test_suite_gcm.aes128_en" ]
+LOG        = f"{BUILD_DIR}/scripts/log.json"
+CRYPTO_CONFIG_FILE = f"{ROOT}/include/psa/crypto_config.h"
+
+
+TEMP_COMMIT_MSG = "temp commit for benchmarking"
+
+SHOW_RAW_BUILD = False
+SHOW_RAW_BENCH = False
+SHOW_RAW_TEST  = False
+
+BENCHMARKS = ["aes_ctr", "ctr_drbg", "aes_gcm"]
+
+def gen_opt_combos():
+    if args.gcc:
+        compilers = ["gcc-15"]
+    else:
+        compilers = COMPILERS
+    if args.X:
+        opts = []
+        if not args.no_aesce:
+            opts += [ "MBEDTLS_AESCE_C" ]
+        if not args.only_128:
+            opts += [ "MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH" ]
+        compilers = [ "clang-17", "gcc-15" ]
+    else:
+        opts = []
+    opts += OPTS
+
+    cs = set(itertools.combinations((True, False) * len(opts), len(opts)))
+    def_opts = [list(zip(opts, c)) for c in sorted(cs)]
+
+    opts = []
+    for cc in compilers:
+        for do in def_opts:
+            opts.append({"cc": cc, "options": do})
+    if not args.X:
+        for o in opts:
+            o["options"] += [
+            ("MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH", args.only_128),
+            ("MBEDTLS_AESCE_C", not args.no_aesce),
+            ("PSA_WANT_ALG_GCM", args.gcm),
+            ("MBEDTLS_BLOCK_CIPHER_NO_DECRYPT", True)
+        ]
+    else:
+        for o in opts:
+            if args.gcm:
+                o["options"] = [t for t in o["options"] if t[0] != "PSA_WANT_ALG_GCM"]
+                o["options"] += [("PSA_WANT_ALG_GCM", True)]
+            if args.only_128:
+                o["options"] = [t for t in o["options"] if t[0] != "MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH"]
+                o["options"] += [("MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH", True)]
+
+
+    for o in opts:
+        if not any(x[0] == "MBEDTLS_AESCE_C" for x in o["options"]):
+            o["options"].append(("MBEDTLS_AESCE_C", False))
+        if not any(x[0] == "PSA_WANT_ALG_GCM" for x in o["options"]):
+            o["options"].append(("PSA_WANT_ALG_GCM", False))
+        if not any(x[0] == "MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH" for x in o["options"]):
+            o["options"].append(("MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH", False))
+
+        if not any(x[0] == "MBEDTLS_AES_USE_HARDWARE_ONLY" for x in o["options"]):
+            if ("MBEDTLS_AESCE_C", True) in o["options"]:
+                o["options"].append(("MBEDTLS_AES_USE_HARDWARE_ONLY", True))
+            else:
+                o["options"].append(("MBEDTLS_AES_USE_HARDWARE_ONLY", False))
+
+    # remove dupes, make into a dict
+    for c in opts:
+        c["options"] = {t[0]: t[1] for t in c["options"]}
+
+    return opts
+
+
+def update_file(fn, content):
+    with open(fn) as f:
+        content_current = f.read()
+    if content != content_current:
+        with(open(fn, "w")) as f:
+             f.write(content)
+
+
+def write_opts(l):
+    s = "#ifndef OPTS_H\n#define OPTS_H\n\n"
+    # #ifndef MBEDTLS_AESCE_C\n#define MBEDTLS_AESCE_C 1\n#endif\n\n"
+    for o, e in l["options"].items():
+        if o.startswith("MBEDTLS_"): continue
+        if e:
+            s += f"#define OPT_{o} 1\n"
+        else:
+            s += f"#undef OPT_{o}\n"
+    s += "#endif"
+    update_file(OPTS_FILE, s)
+    
+
+def set_config(c, e):
+    with open(CRYPTO_CONFIG_FILE) as f:
+        ls = f.readlines()
+    for i, l in enumerate(ls):
+        if '#define' in l and c in l:
+            if e and l.startswith('//'):
+                ls[i] = l[2:]
+            elif (not e) and (not l.startswith('//')):
+                ls[i] = '//' + l
+    content = "".join(ls)
+    update_file(CRYPTO_CONFIG_FILE, content)
+
+
+def run(cmd: str, env={}, fatal=True, dir=None, verbose=False) -> tuple[int, str]:
+    e = {}
+    e.update(os.environ)
+    e.update(env)
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=e,
+        cwd=dir
+    )
+    if verbose or (result.returncode != 0 and fatal):
+        print(cmd)
+        print(result.stdout)
+        print(f"returncode: {result.returncode}")
+        if result.returncode != 0 and fatal:
+            exit(result.returncode)
+    return result.returncode, result.stdout
+
+
+def cmake(cc):
+    bdir = f"{BUILD_DIR}/{cc.split("/")[-1]}"
+    if cc == "clang-17":
+        cc = "/usr/bin/clang"
+    elif cc == "gcc-15":
+        cc = "/opt/homebrew/bin/gcc-15"
+    elif cc == "clang-21":
+        cc = "/opt/homebrew/opt/llvm/bin//clang-21"
+    else:
+        assert(False)
+    cflags = f"{OPT_FLAG} {CFLAGS}"
+    try:
+        shutil.rmtree(bdir, ignore_errors=True)
+    except:
+        pass
+    ccflags = \
+        f"-DCMAKE_C_COMPILER={cc} " \
+        f"-DCMAKE_CXX_COMPILER={cc} "     \
+        f"-DCMAKE_C_FLAGS=\"{cflags}\" "
+
+    cmd = f"cmake -S {ROOT} -B {bdir} {ccflags}"
+    run(cmd, env={"CFLAGS": CFLAGS}, verbose=SHOW_RAW_BUILD)
+
+
+def current_cc():
+    try:
+        assert(False)
+        with open(f"{BUILD_DIR}/{cc}/CMakeCache.txt") as f:
+            ls = f.readlines()
+        for l in ls:
+            if l.startswith("CMAKE_C_COMPILER:STRING"):
+                cc = l.split("/")[-1].strip()
+                if cc == "clang": cc = "clang-17"
+                return cc
+    except:
+        return None
+
+
+def build(config):
+    tests = [
+        ""
+    ]
+    #os.makedirs(f"{BUILD_DIR}/{config["cc"]}/programs/test", exist_ok=True)
+    #os.makedirs(f"{BUILD_DIR}/{config["cc"]}/core", exist_ok=True)
+    #os.makedirs(f"{BUILD_DIR}/{config["cc"]}/tests", exist_ok=True)
+    os.makedirs(f"{BUILD_DIR}/{config["cc"]}", exist_ok=True)
+
+    for o in config["options"]:
+        if o.startswith("MBEDTLS_") or o.startswith("PSA_"):
+            set_config(o, config["options"][o])
+    write_opts(config)
+
+    #if current_cc() != config["cc"]:
+    #    clean = True
+
+    if args.clean or args.cmake:
+        if not args.quiet: print("clean")
+        #run(f"make -C {BUILD_DIR}/{config["cc"]} clean", verbose=SHOW_RAW_BUILD)
+        run(f"rm -rf {BUILD_DIR}/{config["cc"]}")
+    else:
+        if ALWAYS_FAST_CLEAN:
+            for x in \
+                ["tests/" + x for x in TEST_SUITES] + \
+                ["tests/CMakeFiles/test_suite_aes.ctr.dir/test_suite_aes.ctr.c.o",
+                 "drivers/builtin/CMakeFiles/builtin.dir/src/aesce.c.o",
+                 "drivers/builtin/CMakeFiles/builtin.dir/src/aesce.c.o.d",
+                 "drivers/builtin/CMakeFiles/builtin.dir/src/aes.c.o",
+                 "programs/test/benchmark", "core/libtfpsacrypto.a"]:
+                if os.path.exists(f"{BUILD_DIR}/{config["cc"]}/{x}"):
+                    os.remove(f"{BUILD_DIR}/{config["cc"]}/{x}")
+
+    cmakefile = f"{BUILD_DIR}/{config["cc"]}/CMakeCache.txt"
+    if args.cmake or not os.path.exists(cmakefile):
+        if not args.quiet: print("cmake")
+        cmake(config["cc"])
+
+    bench = args.bench
+    test  = args.test
+    if (not args.test) and args.bench and (not args.size):
+        bench = True
+        test = True
+    if not args.bench:
+        test = True
+    bench=True
+
+    if not args.quiet: print("make")
+    #run(f"make -j20 -C {BUILD_DIR}/{config["cc"]} tests/{TEST_SUITE} programs/test/benchmark", verbose=SHOW_RAW_BUILD)
+    if test:
+        run(f"make -j -C {BUILD_DIR}/{config["cc"]}/tests {" ".join(TEST_SUITES)}", verbose=SHOW_RAW_BUILD)
+    if bench:
+        run(f"make -j -C {BUILD_DIR}/{config["cc"]}/programs/test benchmark", verbose=SHOW_RAW_BUILD)
+    if args.size:
+        #run(f"make -j10 -C {BUILD_DIR}/{config["cc"]}/drivers/builtin/CMakeFiles/builtin.dir src/aesce.c.o.d", verbose=SHOW_RAW_BUILD)
+        run(f"make -j -C {BUILD_DIR}/{config["cc"]}/tests {TEST_SUITES[0]}", verbose=SHOW_RAW_BUILD)
+
+
+def test():
+    results = {}
+    for s in TEST_SUITES:
+        rc, output = run(f"{BUILD_DIR}/{config["cc"]}/tests/{s}", verbose=False)
+        results[s] = {
+            "output": output.splitlines()[-1] if rc == 0 else output,
+            "rc": rc
+        }
+    return results
+
+
+def get_size(quiet=True):
+    _, output = run(f"size {BUILD_DIR}/{config["cc"]}/core/libtfpsacrypto.a")
+    ls = output.strip().split("\n")[1:]
+    #ls = [l.split("\t")[:2] + [l.split("\t")][-1] for l in ls if "aes" in l and not "aesni" in l]
+    ls = [l.split("\t") for l in ls]
+    ls = [l for l in ls if l[0] + l[1] != "00"]
+    ls = sorted(ls, key=lambda t:int(t[0]) + int(t[1]))
+    ls = [l[:-1] + [l[-1].split("(")[-1][:-3]] for l in ls]
+    if not quiet:
+        for x in ls:
+            print("\t".join(x))
+    
+    size = {
+    }
+    sm = 0
+    for l in ls:
+        src = l[-1]
+        st = int(l[0])
+        sd = int(l[1])
+        size[src] = { "text": st, "data": sd, "sum": st + sd }
+        sm += st + sd
+    size["total"] = sm
+    size["aes"] = sum(size[x]["sum"] for x in size.keys() if "aes" in x)
+    return size
+
+
+def bench(config):
+    hashes = get_hash()
+    timestamp = datetime.datetime.now().isoformat()
+    size = get_size(quiet=True)
+
+    if args.test:
+        if not args.quiet: print("test")
+        test_result = test()
+        for t, r in test_result.items():
+            if r["rc"] == 0:
+                #if not args.quiet: print(f"    {t}: ok")
+                if SHOW_RAW_TEST:
+                    print(r['output'])
+            else:
+                print(f"{t} FAILED\n{r['output']}\n")
+    else:
+        test_result = {"skipped": True, "suite": " ".join(TEST_SUITES), "returncode": None, "output": None}
+    best_results = {}
+    raw_results = {}
+    if args.bench:
+        if not args.quiet: print("bench")
+        # TODO handle multiple algs better
+        for i in range(0, BENCH_ITERS):
+            if i > 0: time.sleep(BENCH_SLEEP)
+            for bench in BENCHMARKS:
+                cmd = f"{BUILD_DIR}/{config["cc"]}/programs/test/benchmark {bench}"
+                rc, output = run(cmd, verbose=False, fatal=False)
+                if SHOW_RAW_BENCH and i == (BENCH_ITERS - 1): print(output + "\n\n")
+                #assert(rc == 0)
+                br = {l.split(":")[0].strip(): float(l.split(":")[1].strip().split()[0]) / 1024 for l in output.split("\n") if "KiB/s" in l}
+                for k, v in br.items():
+                    raw_results.setdefault(k, []).append(v)
+        for k in raw_results:
+            best_results[k] = max(raw_results[k])
+    result = {
+        "size": size,
+        "hash_tmp": hashes[0],
+        "hash": hashes[1],
+        "timestamp": timestamp,
+        "test": test_result,
+        "config": config,
+        "raw_perf": raw_results,
+        "best_perf": best_results
+    }
+    return result
+
+
+def run_contains(search, cmd):
+    rc, output = run(cmd)
+    assert(rc == 0)
+    return search in output
+
+def get_hash():
+    changed = [x for x in run("git status --porcelain")[1].splitlines() if not x.startswith("?? ")]
+    changed = [x for x in changed if x.split()[-1] not in ["framework", "include/psa/crypto_config.h" ]]
+    if not changed:
+        hashes = (None, run("git log -1 --format=%h")[1].strip())
+    else:
+        run("git add -u .")
+        run(f"git commit -m '{TEMP_COMMIT_MSG}'")
+        hashes = run("git log -2 --format=%h")[1].split("\n")
+        run("git reset --mixed HEAD~1")
+    return hashes
+
+
+def log_result(result):
+    if os.path.exists(LOG):
+        with open(LOG, "r") as f:
+            j = json.loads(f.read())
+    else:
+        j = []
+    j.append(result)
+    with open(LOG, "w") as f:
+        f.write(json.dumps(j, indent=4))
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-a", "--tag", action="store", default=None)
+parser.add_argument("-l", "--log", action="store_true", default=False)
+
+parser.add_argument("-c", "--clean", action="store_true", default=False)
+parser.add_argument("-m", "--cmake", action="store_true", default=False)
+parser.add_argument("-b", "--bench", action="store_true", default=False)
+parser.add_argument("-B", "--no-bench", action="store_true", default=False)
+parser.add_argument("-t", "--test", action="store_true", default=False)
+parser.add_argument("-T", "--no-test", action="store_true", default=False)
+parser.add_argument("-s", "--size", action="store_true", default=False)
+
+parser.add_argument("-A", "--no-aesce", action="store_true", default=False)
+parser.add_argument("-1", "--only-128", action="store_true", default=False)
+parser.add_argument("--gcm", action="store_true", default=False)
+
+parser.add_argument("-g", "--gcc", action="store_true", default=False)
+parser.add_argument("-X", action="store_true", default=False)
+parser.add_argument("-q", "--quiet", action="store_true", default=False)
+parser.add_argument("-Z", "--change-crypto-config", action="store_true", default=False)
+parser.add_argument("-H", "--hash", action="store", default=None)
+
+args = parser.parse_args()
+args.bench |= args.X
+args.test  |= args.bench
+args.test  &= not args.size
+args.quiet |= args.X
+args.test  &= not args.no_test
+args.bench &= not args.no_bench
+
+
+def get_results(hash=None):
+    with open(LOG, "r") as f:
+        j = json.loads(f.read())
+    return [x for x in j if hash.startswith(x["hash"])]
+
+
+def update_results():
+    #todo remove
+    with open(LOG, "r") as f:
+        j = json.loads(f.read())
+    j2 = []
+    for i, x in enumerate(j[:]):
+        #if "PSA_WANT_ALG_GCM" not in x["config"]["options"]:
+        #    x["config"]["options"]["PSA_WANT_ALG_GCM"] = False
+        j2.append(x)
+    with open(LOG, "w") as f:
+        f.write(json.dumps(j2, indent=4))
+
+#update_results()
+#exit(0)
+
+def get_baseline(config, _json=[]):
+    if len(_json) == 0:
+        if not os.path.exists(LOG):
+            _json.append(None)
+        else:
+            with open(LOG, "r") as f:
+                _json.append(json.loads(f.read()))
+    if _json[0] is None:
+        return None
+    j = reversed([x for x in _json[0] if x.get("comment", "") == "baseline"]) # newest first
+    for x in j:
+        xc = x["config"]
+        if xc["cc"] != config["cc"]:
+            continue
+        xt = tuple((k,v) for k, v in xc["options"].items())
+        ct = tuple((k,v) for k, v in config["options"].items())
+        if xt == ct:
+            return x
+    return None
+
+
+    # PSA_WANT_ALG_GCM disabled
+    aesce = get_option(config, "MBEDTLS_AESCE_C")
+    only128 = get_option(config, "MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH")
+    cc = config["cc"]
+
+    # with no decrypt, hw only if aesce, no gcm
+    T=True;F=False
+    if False:
+        baselines = {
+            # 128, aesce
+            (F,F,"clang-17"):(7156,558.3),
+            (F,T,"clang-17"):(1115,7530.1),
+            (T,F,"clang-17"):(6704,555.2),
+            (T,T,"clang-17"):(923,7594.7),
+
+            (F,F,"gcc-15"):(7376,553.5),
+            (F,T,"gcc-15"):(2110,5354.7),
+            (T,F,"gcc-15"):(6984,542.0),
+            (T,T,"gcc-15"):(1954,5254.4)
+        }
+    else:
+        baselines = {
+            # 128, aesce
+            (F,F,"clang-17"):(7156,558),
+            (F,T,"clang-17"):(1115,7530),
+            (T,F,"clang-17"):(6704,529),
+            (T,T,"clang-17"):(923,7183),
+
+            (F,F,"gcc-15"):(7376,506),
+            (F,T,"gcc-15"):(2110,4956),
+            (T,F,"gcc-15"):(6984,506),
+            (T,T,"gcc-15"):(1954,4944)
+        }
+
+
+    return baselines[(only128, aesce, cc)]
+
+def print_results(data, show_header=True, confluence=True):
+    KEY_ORDER = [ "cc", "MBEDTLS_AESCE_C", "MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH" ]
+    NO_SHOW_KEYS = { "MBEDTLS_AES_USE_HARDWARE_ONLY" }
+
+    def abbrev(k):
+        if k == "AESCE_C": k = "AESCE"
+        elif k == "MBEDTLS_AES_USE_HARDWARE_ONLY": k="HW_ONLY"
+        elif k == "MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH": k="128_ONLY"
+        elif k == "MBEDTLS_BLOCK_CIPHER_NO_DECRYPT": k="NO_DECRYPT"
+        elif k == "PSA_WANT_ALG_GCM": k = "GCM"
+        elif k.startswith("MBEDTLS_"): k = k[8:]
+        elif k.startswith("PSA_"): k = k[8:]
+        return k
+
+    # config keys
+    keys1 = []
+    s = set()
+    for d in data:
+        s = s.union(d["config"]["options"].keys())
+    keys1 = ["cc"] + list(sorted(s))
+    keys1 = [k for k in keys1 if k not in NO_SHOW_KEYS]
+
+    # sort columns
+    keys11 = []
+    for k in KEY_ORDER:
+        if k in keys1:
+            keys11.append(k)
+    for k in keys1:
+        if k not in KEY_ORDER:
+            keys11.append(k)
+    keys1 = keys11
+
+    # result keys
+    s = set()
+    for d in data:
+        s = s.union(d["raw_perf"].keys())
+    keys2 = ["size"] + sorted(s)
+    keys = keys1 + keys2
+
+    # sort rows
+    for k in reversed(keys1):
+        if k in d["config"]["options"]:
+            data = sorted(data, key=lambda d: d["config"]["options"][k])
+    data = sorted(data, key=lambda d: d["config"]["cc"])
+
+    # aggregate rows
+    data2 = {}
+    for d in data:
+        c = tuple([d["config"]["cc"]] + [(k, v) for k, v in sorted(d["config"]["options"].items(), key=lambda t: t[0])])
+        if c not in data2:
+            data2[c] = d
+        else:
+            a = data2[c]
+            for k in d["raw_perf"]:
+                if k not in a["raw_perf"]: a["raw_perf"][k] = []
+                for r in d["raw_perf"][k]:
+                    a["raw_perf"][k].append(r)
+    data = list(data2.values())
+
+
+    # gather items to print as tuple (data, baseline)
+    table = []
+    for d in data:
+        b = get_baseline(d["config"]) if d.get("comment", "") != "baseline" else None
+        row = []
+        for k in keys1:
+            if k == "cc":
+                row.append(d["config"]["cc"])
+            elif k in d["config"]["options"]:
+                row.append(d["config"]["options"][k])
+            else:
+                row.append(None)
+        for k in keys2:
+            nd = 1
+            nb = 1
+            if k == "size":
+                dd = d["size"]["aes"]
+                bd = None if b is None else b["size"]["aes"]
+            else:
+                if k not in d["raw_perf"]:
+                    dd = None
+                    bd = None
+                else:
+                    dd = d["raw_perf"][k]
+                    bd = None if b is None or k not in b["raw_perf"] else b["raw_perf"][k]
+            if type(dd) is list:
+                if len(dd) > 1:
+                    rsd = statistics.stdev(dd) / statistics.mean(dd)
+                    assert(rsd < 0.1)
+                nd = len(dd)
+                dd = max(dd)
+                #dd = statistics.mean(dd)
+            if type(bd) is list:
+                if len(bd) > 1:
+                    rsd = statistics.stdev(bd) / statistics.mean(bd)
+                    assert(rsd < 0.1)
+                nb = len(bd)
+                bd = max(bd)
+                #bd = statistics.mean(bd)
+            if dd is None: nd = 0
+            if bd is None: nb = 0
+            row.append((k, dd, bd, nd, nb))
+        table += [row]
+
+
+    # convert to str
+    stable = []
+    for row in table:
+        srow = []
+        for c in row:
+            rel = False
+            if type(c) is tuple:
+                k, dd, bd, nd, nb = c
+                if bd is None:
+                    # no baseline data, show absolute value
+                    d = dd
+                elif dd is None:
+                    d = ""
+                else:
+                    rel=True
+                    if k == "size":
+                        d = dd - bd
+                    else:
+                        d = dd / bd - 1
+            else:
+                d = c
+
+            if d is None:
+                s = ""
+            elif type(d) is bool:
+                s = "1" if d else "0"
+            elif type(d) is float:
+                if rel:
+                    s = f"{100 * d:+.0f}%"
+                    if s == "-0%": s = "0%"
+                else:
+                    s = f"{d:.0f}"
+            else:
+                if rel:
+                    s = f"{d:+.0f}"
+                else:
+                    s = f"{d}"
+            #s = f"({nd}): {s}"
+            srow.append(s)
+        stable.append(srow)
+    
+    if show_header:
+        stable = [[abbrev(x) for x in keys]] + stable
+
+    # get col widths
+    ws = [max([len(r[i]) for r in stable]) for i in range(0, len(stable[0]))]
+
+    # print aligned text
+    if confluence:
+        seps = [("|| ", " || ", " ||"), ("|  ", "  | ", "  |")]
+    else:
+        seps = [("", ", ", ""), ("", ", ", "")]
+    for row_i, r in enumerate(stable):
+        ss = seps[0 if row_i == 0 else 1]
+        for i, c in enumerate(r):
+            pre_sep = ss[0] if i == 0 else ""
+            sep = ss[1] if i > 0 else ""
+            pad = " " * (ws[i] - len(c))
+            print(f"{pre_sep}{sep}{pad}{c}", end="")
+        print(ss[-1])
+    print()
+
+if args.hash:
+    results = get_results(hash=args.hash)
+    if results:
+        print_results(results)
+    exit(0)
+
+try:
+    if os.path.exists(CRYPTO_CONFIG_FILE + ".bak"):
+        os.remove(CRYPTO_CONFIG_FILE + ".bak")
+    shutil.copy(CRYPTO_CONFIG_FILE, CRYPTO_CONFIG_FILE + ".bak")
+
+    results = []
+    for config in gen_opt_combos():
+        l = []
+        for o in config["options"]:
+            if o[0].startswith("MBEDTLS"):
+                l.append(f"{o[0][0:]}={o[1]}")
+
+        baseline = get_baseline(config)
+        build(config)
+        result=bench(config)
+        results.append(result)
+
+        if args.tag:
+            result["comment"] = args.tag
+        if args.log:
+            log_result(result)
+
+        if args.test:
+            if any(x["rc"] != 0 for x in result["test"].values()):
+                for s in result["test"]:
+                    if result['test'][s]["rc"] != 0:
+                        print(f"{s}:\n{result['test'][s]['output']}\n")
+                    else:
+                        print(f"{s}: ok")
+            else:
+                if not args.quiet:
+                    print(f"{len(result['test'])} test suites ok")
+
+        print_results(results)
+
+        if False:
+            if args.X:
+                cs = f"{config['cc']:8}: aesce={get_option(config, "AESCE_C")}, 128={get_option(config, "ONLY_128")}"
+                s = result['size']['aes']
+                rs = f"{cs}, size={s}"
+                if args.bench:
+                    rs += f", ctr-128={result['best_perf']['AES-CTR-128']:5.0f}"
+                    if args.gcm:
+                        rs += f", gcm-128={result['best_perf']['AES-GCM-128']:5.0f}"
+                    #print(json.dumps(result,indent=4))
+                    rs += f", ctr-drbg-nopr={result['best_perf']['CTR_DRBG (NOPR)']:5.0f}"
+                print(rs)
+                if False:
+                    l = [config["cc"]]
+                    for o in config["options"]:
+                        if o[0].startswith("MBEDTLS"):
+                            l.append(f"{o[0][8:]}={o[1]}")
+                    #print(", ".join(l))
+                    if args.bench:
+                        print(f"before: {baseline[0]} {baseline[1]:.0f}")
+                        print(f"after:  {s}, {p:.0f}")
+                        print(f"diff:   {s - baseline[0]:+.0f}, {(100.0 * p/baseline[1]) - 100.0:+.0f}%")
+                    else:
+                        print(f"before: {baseline[0]}")
+                        print(f"after:  {s}")
+                        print(f"diff:   {s - baseline[0]:+.0f}")
+            else:
+                #print(json.dumps(result, indent=4))
+                #print()
+                for k, v in result['best_perf'].items():
+                    print(f"{k}: {v:7.1f} MB/s")
+                print()
+
+                s = result['size']['aes']
+                p = result['best_perf']['AES-CTR-128'] if args.bench else 0
+                if False:
+                    print(f"openssl:                  perf = 17816.1 MB/s")
+                    print(f"baseline:   size = {baseline[0]:5}, perf = {baseline[1]:7.1f} MB/s")
+                    print(f"this build: size = {s:5}, perf = {p:7.1f} MB/s")
+                sd = s - baseline[0]
+                if args.bench:
+                    print(f"//            {config['cc']}: size = {sd:+5}, perf = {100.0 * (p / baseline[1] - 1.0):+.0f}%")
+                else:
+                    print(f"//            {config['cc']}: size = {sd:+5}")
+                print("//")
+
+finally:
+    if not args.change_crypto_config:
+        if run(f"diff -q -s {CRYPTO_CONFIG_FILE} {CRYPTO_CONFIG_FILE}.bak", verbose=False, fatal=False)[0] != 0:
+            os.remove(CRYPTO_CONFIG_FILE)
+            shutil.copy(CRYPTO_CONFIG_FILE + ".bak", CRYPTO_CONFIG_FILE)
+        os.remove(CRYPTO_CONFIG_FILE + ".bak")
